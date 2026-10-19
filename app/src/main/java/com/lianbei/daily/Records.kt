@@ -108,6 +108,7 @@ interface RecordDao {
     @Query("SELECT * FROM payments WHERE id = :id") suspend fun payment(id: String): PendingPayment?
     @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun addPayment(payment: PendingPayment): Long
     @Query("UPDATE payments SET status = :status WHERE id = :id AND status = 'pending'") suspend fun resolve(id: String, status: String): Int
+    @Query("DELETE FROM payments WHERE id = :id") suspend fun deletePending(id: String)
     @Transaction suspend fun confirm(id: String, category: String = "其他") {
         val p = payment(id) ?: return
         if (resolve(id, "confirmed") == 1) {

@@ -28,9 +28,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 @Composable
-fun DailyApp(dao: RecordDao, openPayments: Boolean = false) {
+fun DailyApp(dao: RecordDao, openPayments: Boolean = false, onPaymentsConsumed: () -> Unit = {}) {
     var page by rememberSaveable { mutableStateOf("今天") }
     var paymentInbox by rememberSaveable { mutableStateOf(openPayments) }
+    LaunchedEffect(openPayments) { if (openPayments) paymentInbox = true }
     val pendingPayments by dao.pending().collectAsStateWithLifecycle(emptyList())
     val foodRows by dao.foodEntries().collectAsStateWithLifecycle(initialValue = null)
     val foodEntries = foodRows.orEmpty()
@@ -162,7 +163,7 @@ fun DailyApp(dao: RecordDao, openPayments: Boolean = false) {
         }
     }
     if(clearDemo) AlertDialog(onDismissRequest={clearDemo=false},title={Text("清除示例数据？")},text={Text("仅清除标记为示例的记录及其自动生成的消费；你自行添加的记录会保留。")},confirmButton={TextButton(enabled=!demoBusy,onClick={demoBusy=true;scope.launch {try {DemoData.clear(dao);cleanPhotos();clearDemo=false;snackbar.showSnackbar("示例数据已清除")}catch(_:Exception){snackbar.showSnackbar("清除失败，请重试")}finally {demoBusy=false}}}){Text("确认清除")}},dismissButton={TextButton(onClick={clearDemo=false}){Text("取消")}})
-    if (paymentInbox) PaymentInbox(dao) { paymentInbox = false }
+    if (paymentInbox) PaymentInbox(dao) { paymentInbox = false; onPaymentsConsumed() }
     selected?.let { kind ->
         if(kind==Kind.FOOD.name) {
             if(foodRows!=null && (editingId==null || editing!=null)) FoodEditor(dateText,editing,foodEntries.find {it.foodId==editingId},all,foodEntries,subscriptionPayments,saving,saveError,{selected=null}) {record,photo,cents,existing->

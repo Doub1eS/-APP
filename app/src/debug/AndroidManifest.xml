@@ -1,0 +1,22 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Debug builds only: local verification hooks used by scripts/ADB. Not part of a release build. -->
+    <application>
+        <receiver android:name=".DebugCaptureReceiver" android:exported="true" android:process=":capture">
+            <intent-filter>
+                <action android:name="com.lianbei.daily.DEBUG_SIMULATE" />
+                <action android:name="com.lianbei.daily.DEBUG_DUMP" />
+                <action android:name="com.lianbei.daily.DEBUG_SELFTEST" />
+                <action android:name="com.lianbei.daily.DEBUG_TOGGLE" />
+                <action android:name="com.lianbei.daily.DEBUG_DRAIN" />
+                <action android:name="com.lianbei.daily.DEBUG_REBIND" />
+                <action android:name="com.lianbei.daily.DEBUG_REBIND_HARD" />
+            </intent-filter>
+        </receiver>
+        <receiver android:name=".DebugDbReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="com.lianbei.daily.DEBUG_DB" />
+                <action android:name="com.lianbei.daily.DEBUG_DELETE_PENDING" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

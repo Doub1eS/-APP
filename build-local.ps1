@@ -1,4 +1,4 @@
-param([switch]$Test, [switch]$DeviceTest, [int]$ProxyPort = 0)
+﻿param([switch]$Test, [switch]$DeviceTest, [int]$ProxyPort = 0)
 $ErrorActionPreference = 'Stop'
 $projectRoot = $PSScriptRoot
 if (Test-Path 'F:\lianbei-build\settings.gradle.kts') { $projectRoot = 'F:\lianbei-build' }

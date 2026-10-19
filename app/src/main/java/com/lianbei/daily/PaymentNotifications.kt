@@ -5,84 +5,47 @@ import android.content.*
 import android.graphics.drawable.Icon
 import android.os.Bundle
 import android.provider.Settings
-import android.service.notification.NotificationListenerService
-import android.service.notification.StatusBarNotification
 import kotlinx.coroutines.*
 import org.json.JSONObject
-import java.time.Instant
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
-
-object PaymentSettings {
-    fun enabled(c: Context) = c.getSharedPreferences("payments", 0).getBoolean("enabled", false)
-    fun enable(c: Context, value: Boolean) {
-        val prefs=c.getSharedPreferences("payments",0)
-        prefs.edit().putBoolean("enabled",value).putString("session",java.util.UUID.randomUUID().toString()).apply {
-            if(value && !prefs.getBoolean("enabled",false)) putLong("enabled_at",System.currentTimeMillis())
-        }.apply()
-    }
-    fun session(c:Context)=c.getSharedPreferences("payments",0).getString("session","legacy").orEmpty()
-    fun enabledAt(c:Context)=c.getSharedPreferences("payments",0).getLong("enabled_at",System.currentTimeMillis())
-}
-
-class PaymentListener : NotificationListenerService() {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    override fun onListenerConnected() {
-        super.onListenerConnected()
-        PaymentDiagnostics.connected.value=true
-        if(PaymentSettings.enabled(this)) {
-            // Only still-visible recent notifications since opt-in; this is not a historical bill import.
-            val cutoff=maxOf(PaymentSettings.enabledAt(this),System.currentTimeMillis()-86_400_000)
-            runCatching { activeNotifications }.getOrNull()?.filter {it.postTime>=cutoff}?.forEach {capture(it)}
-        }
-    }
-    override fun onListenerDisconnected() {
-        PaymentDiagnostics.connected.value=false
-        super.onListenerDisconnected()
-        if(PaymentSettings.enabled(this)) runCatching { requestRebind(ComponentName(this,PaymentListener::class.java)) }
-    }
-    override fun onDestroy() {
-        PaymentDiagnostics.connected.value=false
-        scope.cancel()
-        super.onDestroy()
-    }
-    override fun onNotificationPosted(sbn: StatusBarNotification) { capture(sbn) }
-    private fun capture(sbn:StatusBarNotification) {
-        if(!PaymentSettings.enabled(this)) return
-        if(sbn.packageName==packageName && sbn.id==PaymentNotifications.SELF_TEST_ID && sbn.notification.channelId==PaymentNotifications.SELF_TEST_CHANNEL) {
-            PaymentDiagnostics.prefs(this).edit().putLong("self_received",System.currentTimeMillis()).apply()
-            runCatching {cancelNotification(sbn.key)}
-            return
-        }
-        if(sbn.packageName !in PaymentParser.sources) return
-        val session=PaymentSettings.session(this)
-        scope.launch {PaymentCapture.accept(this@PaymentListener,DailyDatabase.get(this@PaymentListener).records(),sbn.packageName,sbn.key,sbn.postTime,sbn.notification,session)}
-    }
-}
 
 object PaymentNotifications {
-    const val SELF_TEST_ID=201
-    const val SELF_TEST_CHANNEL="payment_listener_check"
-    fun selfTest(c:Context):Boolean {
-        val manager=c.getSystemService(NotificationManager::class.java)
-        if(!manager.areNotificationsEnabled()) return false
-        manager.createNotificationChannel(NotificationChannel(SELF_TEST_CHANNEL,"通知监听检查",NotificationManager.IMPORTANCE_LOW))
-        if(manager.getNotificationChannel(SELF_TEST_CHANNEL)?.importance==NotificationManager.IMPORTANCE_NONE) return false
-        PaymentDiagnostics.prefs(c).edit().putLong("self_requested",System.currentTimeMillis()).putLong("self_received",0).apply()
+    const val SELF_TEST_ID = 201
+    const val SELF_TEST_CHANNEL = "payment_listener_check"
+
+    fun selfTest(c: Context): Boolean {
+        val manager = c.getSystemService(NotificationManager::class.java)
+        if (!manager.areNotificationsEnabled()) return false
+        manager.createNotificationChannel(NotificationChannel(SELF_TEST_CHANNEL, "通知监听检查", NotificationManager.IMPORTANCE_LOW))
+        if (manager.getNotificationChannel(SELF_TEST_CHANNEL)?.importance == NotificationManager.IMPORTANCE_NONE) return false
+        CaptureStore.update(c) { values ->
+            values["self_requested"] = System.currentTimeMillis().toString()
+            values["self_received"] = "0"
+        }
         return runCatching {
-            manager.notify(SELF_TEST_ID,Notification.Builder(c,SELF_TEST_CHANNEL).setSmallIcon(android.R.drawable.ic_menu_info_details)
-                .setContentTitle("练呗通知监听检查").setContentText("用于检查通知是否送达监听服务，不会生成消费记录。").setTimeoutAfter(15_000).build())
+            manager.notify(
+                SELF_TEST_ID,
+                Notification.Builder(c, SELF_TEST_CHANNEL).setSmallIcon(android.R.drawable.ic_menu_info_details)
+                    .setContentTitle("练呗通知监听检查")
+                    .setContentText("用于检查通知是否送达监听服务，不会生成消费记录。")
+                    .setTimeoutAfter(15_000).build()
+            )
             true
         }.getOrDefault(false)
     }
+
     const val CHANNEL = "payment_confirmations"
+
     fun cancel(c: Context, id: String) = c.getSystemService(NotificationManager::class.java).cancel(id, 200)
+
     fun show(c: Context, p: PendingPayment) {
         val manager = c.getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(CHANNEL, "支付待确认", NotificationManager.IMPORTANCE_HIGH).apply { lockscreenVisibility = Notification.VISIBILITY_PRIVATE })
         if (!manager.areNotificationsEnabled()) return
-        try { manager.notify(p.id, 200, build(c, p)) } catch (_: SecurityException) { /* Pending inbox remains available. */ }
+        try {
+            manager.notify(p.id, 200, build(c, p))
+        } catch (_: SecurityException) { /* Pending inbox remains available. */ }
     }
+
     fun build(c: Context, p: PendingPayment, protocol: Int = Settings.System.getInt(c.contentResolver, "notification_focus_protocol", 0)): Notification {
         val icon = Icon.createWithResource(c, android.R.drawable.ic_menu_edit)
         fun action(actionName: String, label: String): Notification.Action {
@@ -125,6 +88,10 @@ object PaymentNotifications {
     }
 }
 
+/**
+ * Handles the notification buttons from the default process. It first drains the capture queue so a
+ * payment that arrived while the UI was closed can still be confirmed without opening the app.
+ */
 class PaymentActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val id = intent.getStringExtra("payment_id") ?: return
@@ -133,11 +100,14 @@ class PaymentActionReceiver : BroadcastReceiver() {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val dao = DailyDatabase.get(context).records()
+                CaptureDrain.drain(context, dao)
                 if (intent.action == "confirm") dao.confirm(id) else dao.resolve(id, "ignored")
                 PaymentNotifications.cancel(context, id)
             } catch (_: Exception) {
                 // Keep the pending entry and notification available for a later retry.
-            } finally { result.finish() }
+            } finally {
+                result.finish()
+            }
         }
     }
 }
