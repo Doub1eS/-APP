@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <provider android:name="com.lianbei.daily.SlowPhotoProvider" android:authorities="com.lianbei.daily.test.slowphotos" android:exported="true" />
+    </application>
+</manifest>

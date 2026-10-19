@@ -12,13 +12,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        val db = Room.databaseBuilder(applicationContext, DailyDatabase::class.java, "daily.db").build()
+        val db = DailyDatabase.get(applicationContext)
         setContent {
-            MaterialTheme(colorScheme = lightColorScheme(
-                primary = Color(0xFF24634C), secondary = Color(0xFF766448),
-                background = Color(0xFFF8F7F2), surface = Color(0xFFF8F7F2),
-                surfaceVariant = Color(0xFFEDEFE5), onBackground = Color(0xFF202B25)
-            )) { DailyApp(db.records()) }
+            LianbeiTheme { DailyApp(db.records(), intent.getBooleanExtra("payments", false)) }
         }
     }
 }

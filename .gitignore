@@ -11,3 +11,9 @@ local.properties
 *.keystore
 .env
 .env.*
+
+# Local device samples, generated builds, screenshots and diagnostic reports
+/1.jpg
+/2.jpg
+/releases/
+/docs/ui-references/
