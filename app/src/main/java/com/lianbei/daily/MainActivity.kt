@@ -18,17 +18,20 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     private var showPayments by mutableStateOf(false)
+    private var showSubscriptions by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         CaptureStore.migrateLegacy(applicationContext)
         showPayments = intent.getBooleanExtra("payments", false)
+        showSubscriptions = intent.getBooleanExtra("subscriptions", false)
         val db = DailyDatabase.get(applicationContext)
         val dao = db.records()
         // The capture process only queues payments; this process owns Room and writes them.
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                SubscriptionReminders.refresh(applicationContext)
                 // Heal a background watch that a force stop or a reboot removed.
                 runCatching {
                     val state = withContext(Dispatchers.IO) { CaptureStore.state(applicationContext) }
@@ -51,7 +54,8 @@ class MainActivity : ComponentActivity() {
         }
         setContent {
             LianbeiTheme {
-                DailyApp(dao, showPayments, onPaymentsConsumed = { showPayments = false })
+                DailyApp(dao, showPayments, onPaymentsConsumed = { showPayments = false },
+                    openSubscriptions = showSubscriptions, onSubscriptionsConsumed = { showSubscriptions = false })
             }
         }
     }
@@ -61,6 +65,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         if (intent.getBooleanExtra("payments", false)) showPayments = true
+        if (intent.getBooleanExtra("subscriptions", false)) { showPayments = false; showSubscriptions = true }
     }
 
     private companion object {

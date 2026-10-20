@@ -23,8 +23,16 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 object FoodPhotos {
+ private val lifecycleLock=Mutex()
+ suspend fun <T> withLifecycleLock(block:suspend ()->T):T =
+  withContext(Dispatchers.IO) { lifecycleLock.withLock { block() } }
+ suspend fun cleanStored(context:Context,dao:RecordDao) = withLifecycleLock {
+  clean(context,dao.allFoodEntries().map {it.photoPath}.toSet())
+ }
  fun clean(context:Context,keep:Set<String>) {
   val dir=File(context.filesDir,"food-photos").canonicalFile
   val paths=keep.filter {it.isNotBlank()}.map {File(it).canonicalPath}.toSet()

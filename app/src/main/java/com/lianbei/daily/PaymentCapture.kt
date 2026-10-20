@@ -49,15 +49,15 @@ object PaymentCapture {
         notification: Notification,
         session: String
     ): String = withContext(Dispatchers.IO) {
-        val state = CaptureStore.state(context)
-        if (state["enabled"] != "true" || session != state["session"].orEmpty()) return@withContext "识别已关闭"
         val source = PaymentParser.sources[pkg] ?: return@withContext "来源未支持"
         fun result(reason: String): String {
             PaymentDiagnostics.record(context, source, reason)
             return reason
         }
-        if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) return@withContext result("通知分组汇总，已跳过")
         try {
+            val state = CaptureStore.state(context)
+            if (state["enabled"] != "true" || session != state["session"].orEmpty()) return@withContext "识别已关闭"
+            if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) return@withContext result("通知分组汇总，已跳过")
             val (title, body) = content(notification)
             val parsed = PaymentParser.inspect(pkg, title, body)
             val payment = parsed.payment ?: return@withContext result(parsed.reason)
@@ -91,7 +91,20 @@ object PaymentCapture {
 /** Writes queued captures into Room. Runs in the default process, which owns the database. */
 object CaptureDrain {
     private val mutex = Mutex()
-    suspend fun drain(context: Context, dao: RecordDao): Int = withContext(Dispatchers.IO) { mutex.withLock {
+    suspend fun drain(context: Context, dao: RecordDao): Int = exclusive(context) {
+        drainLocked(context, dao)
+    }
+
+    suspend fun retryFailed(context: Context, dao: RecordDao): Int = drain(context, dao)
+
+    suspend fun discardFailed(context: Context, expected: CaptureQueueStatus): Int = exclusive(context) {
+        CaptureStore.discardFailed(context, expected)
+    }
+
+    private suspend fun <T> exclusive(context: Context, block: suspend () -> T): T =
+        withContext(Dispatchers.IO) { mutex.withLock { CaptureStore.withDrainLock(context, block) } }
+
+    private suspend fun drainLocked(context: Context, dao: RecordDao): Int {
         var applied = 0
         var batches = 0
         while (batches < 8) {
@@ -100,37 +113,25 @@ object CaptureDrain {
             val lines = android.util.AtomicFile(batch).openRead().bufferedReader().use { it.readLines() }.filter { it.isNotBlank() }
             val keep = mutableListOf<String>()
             lines.forEach { line ->
-                try { apply(dao, line) }
+                var payload = line
+                val entry = try {
+                    payload = CaptureQueueCodec.payload(line)
+                    CaptureQueueCodec.decode(payload)
+                } catch (_: Exception) {
+                    keep.add(CaptureQueueCodec.failed(payload, CaptureQueueCodec.MALFORMED))
+                    return@forEach
+                }
+                try {
+                    if (entry.pending == null) dao.enrichPayment(entry.id, entry.merchant)
+                    else dao.capturePayment(entry.pending, entry.identities, entry.legacy)
+                }
                 catch (e: CancellationException) { throw e }
-                catch (_: Exception) { keep.add(line) }
+                catch (_: Exception) { keep.add(CaptureQueueCodec.failed(payload, CaptureQueueCodec.STORAGE)) }
             }
             CaptureStore.finishBatch(context, batch, keep)
             applied += lines.size - keep.size
             if (keep.isNotEmpty()) break
         }
-        applied
-    } }
-
-    private suspend fun apply(dao: RecordDao, line: String) {
-        val row = org.json.JSONObject(line)
-        val id = row.getString("id")
-        if (row.optString("kind") == "merchant") {
-            dao.enrichPayment(id, row.getString("merchant"))
-            return
-        }
-        val pending = PendingPayment(
-            id,
-            row.getLong("cents"),
-            row.getString("merchant"),
-            row.getString("source"),
-            row.getString("date"),
-            row.getString("time")
-        )
-        dao.capturePayment(pending, strings(row, "identities"), strings(row, "legacy"))
-    }
-
-    private fun strings(row: org.json.JSONObject, key: String): List<String> {
-        val array = row.optJSONArray(key) ?: return emptyList()
-        return (0 until array.length()).mapNotNull { array.optString(it).takeIf { value -> value.isNotBlank() } }
+        return applied
     }
 }

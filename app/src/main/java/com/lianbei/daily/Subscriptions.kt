@@ -6,6 +6,7 @@ import androidx.room.Index
 import java.time.LocalDate
 import java.time.temporal.ChronoUnit
 import java.net.URI
+import java.time.ZonedDateTime
 
 @Entity(tableName="subscriptions")
 data class Subscription(@PrimaryKey val id:String, val name:String, val cents:Long,
@@ -39,4 +40,41 @@ object SubscriptionRules {
   val from=maxOf(today,LocalDate.parse(s.startDate))
   return dates(s,from,from.plusYears(1)).firstOrNull()
  }
+}
+
+enum class SubscriptionFilter(val label: String, val emptyText: String) {
+ ALL("全部", "还没有订阅记录"),
+ ACTIVE("启用", "暂无启用的订阅"),
+ INACTIVE("停用", "暂无停用的订阅"),
+ DUE_SOON("7天内到期", "未来7天没有到期订阅");
+
+ fun apply(subscriptions: List<Subscription>, today: LocalDate): List<Subscription> =
+  subscriptions.filter { s ->
+   when (this) {
+    ALL -> true
+    ACTIVE -> s.active
+    INACTIVE -> !s.active
+    DUE_SOON -> SubscriptionRules.dates(s, today, today.plusDays(6)).isNotEmpty()
+   }
+  }
+}
+
+data class SubscriptionReminderDue(val subscription: Subscription, val due: LocalDate, val checkedOn: LocalDate) {
+ // A length prefix makes IDs containing separators unambiguous.
+ val key: String get() = "$checkedOn|${subscription.id.length}:${subscription.id}|$due"
+}
+
+object SubscriptionReminderRules {
+ fun due(subscriptions: List<Subscription>, payments: List<SubscriptionPayment>, today: LocalDate): List<SubscriptionReminderDue> {
+  val paid = payments.mapTo(HashSet()) { it.subscriptionId to it.dueDate }
+  return subscriptions.flatMap { s ->
+   // One malformed imported row must not suppress reminders for every other subscription.
+   runCatching { SubscriptionRules.dates(s, today, today.plusDays(1)) }.getOrDefault(emptyList())
+    .filter { (s.id to it.toString()) !in paid }
+    .map { SubscriptionReminderDue(s, it, today) }
+  }
+ }
+
+ fun nextCheck(now: ZonedDateTime): ZonedDateTime =
+  now.toLocalDate().plusDays(1).atTime(9, 0).atZone(now.zone)
 }

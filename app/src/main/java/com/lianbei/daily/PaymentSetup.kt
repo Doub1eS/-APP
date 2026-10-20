@@ -17,6 +17,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.time.Instant
@@ -50,7 +51,10 @@ internal suspend fun observeCaptureStatus(
 ) {
     lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
         while (true) {
-            onStatus(readStatus())
+            val status = try { readStatus() }
+            catch (e: CancellationException) { throw e }
+            catch (_: Exception) { PaymentCaptureStatus(readError = CaptureStore.STATE_READ_ERROR) }
+            onStatus(status)
             delay(intervalMs.coerceAtLeast(1L))
         }
     }
@@ -62,7 +66,11 @@ internal suspend fun observeCaptureStatus(
  * and is conservatively represented by false in the existing status fields.
  */
 internal fun settledStatus(context: Context, status: PaymentCaptureStatus): PaymentCaptureStatus {
-    val raw = CaptureStore.state(context)
+    if (status.readError.isNotEmpty()) return status
+    val raw = try { CaptureStore.state(context) }
+    catch (_: Exception) {
+        return status.copy(connected = false, watchRunning = false, readError = CaptureStore.STATE_READ_ERROR)
+    }
     val processes = runCatching {
         context.getSystemService(ActivityManager::class.java)?.runningAppProcesses?.map {
             CaptureProcess(it.pid, it.uid, it.processName)
@@ -77,7 +85,13 @@ internal fun settledStatus(context: Context, status: PaymentCaptureStatus): Paym
     )
 }
 
-@Composable fun PaymentSetup(enabled: Boolean, granted: Boolean, expanded: Boolean, onError: (String) -> Unit) {
+@Composable fun PaymentSetup(
+    enabled: Boolean,
+    granted: Boolean,
+    expanded: Boolean,
+    dao: RecordDao? = null,
+    onError: (String) -> Unit
+) {
     val context = LocalContext.current
     val status = rememberCaptureStatus()
     val remindersNow = context.getSystemService(NotificationManager::class.java)
@@ -87,6 +101,7 @@ internal fun settledStatus(context: Context, status: PaymentCaptureStatus): Paym
     Panel {
         Text(
             when {
+                status.readError.isNotEmpty() -> "采集状态暂不可用"
                 !enabled -> "自动识别未开启"
                 !granted -> "已开启，但系统还没有授权读取通知"
                 !status.connected -> "已授权，尚未确认监听连接"
@@ -94,6 +109,9 @@ internal fun settledStatus(context: Context, status: PaymentCaptureStatus): Paym
                 else -> "后台监听中"
             },
             style = MaterialTheme.typography.titleMedium
+        )
+        if (status.readError.isNotEmpty()) Text(
+            status.readError, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error
         )
         Text(
             "通知读取：${if (granted) "已授权" else "未授权"} · 确认提醒：${if (remindersNow) "可用" else "未开启"} · 后台常驻：${if (status.watchRunning) "运行中" else "未确认运行"}",
@@ -148,8 +166,12 @@ internal fun settledStatus(context: Context, status: PaymentCaptureStatus): Paym
                 if (!openPaymentSetting(context, Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))))
                     onError("无法打开应用信息，请从手机设置进入练呗应用信息。")
             }) { Text("打开练呗应用信息") }
-            TextButton(onClick = { PaymentDiagnostics.clear(context) }) { Text("清除识别诊断记录") }
+            TextButton(onClick = {
+                runCatching { PaymentDiagnostics.clear(context) }
+                    .onFailure { onError("诊断记录清除失败，请稍后重试") }
+            }) { Text("清除识别诊断记录") }
             Text("诊断只保存来源、时间和处理结果，不保存通知原文。", style = MaterialTheme.typography.bodySmall)
         }
     }
+    if (dao != null) CaptureQueuePanel(dao)
 }

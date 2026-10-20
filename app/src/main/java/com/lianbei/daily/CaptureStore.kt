@@ -7,6 +7,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
+import java.security.MessageDigest
 import java.util.Properties
 
 /**
@@ -32,7 +33,17 @@ data class PaymentCaptureStatus(
     val watchSince: Long = 0,
     val queued: Int = 0,
     val lastDrainAt: Long = 0,
-    val refused: String = ""
+    val refused: String = "",
+    val readError: String = ""
+)
+
+/** Only counts, fixed messages and an opaque confirmation token may leave queue storage. */
+data class CaptureQueueStatus(
+    val failedCount: Int = 0,
+    val malformedCount: Int = 0,
+    val storageCount: Int = 0,
+    val confirmationToken: String = "",
+    val readError: String = ""
 )
 
 object CaptureStore {
@@ -41,6 +52,7 @@ object CaptureStore {
     private const val BATCH = "capture-queue.draining"
     private const val SEEN = "capture-seen.tsv"
     private const val LOCK = "capture.lock"
+    private const val DRAIN_LOCK = "capture-drain.lock"
     private const val MAX_SEEN = 800
 
     // FileLock is per-process: two threads in the same process must not race for it.
@@ -66,6 +78,15 @@ object CaptureStore {
             }
         }
     }
+
+    // Held for the whole Room import or discard, including suspensions. Capture append uses its
+    // own short lock so incoming payments can still be journaled while Room is busy.
+    // CaptureDrain's Mutex prevents overlapping JVM locks; this lock also covers other processes.
+    internal suspend fun <T> withDrainLock(ctx: Context, block: suspend () -> T): T =
+        RandomAccessFile(file(ctx, DRAIN_LOCK), "rw").use { raf ->
+            val held = raf.channel.lock()
+            try { block() } finally { held.release() }
+        }
 
     private fun load(ctx: Context): MutableMap<String, String> {
         val properties = Properties()
@@ -104,7 +125,8 @@ object CaptureStore {
     }
 
     fun snapshot(ctx: Context): PaymentCaptureStatus {
-        val values = state(ctx)
+        val values = try { state(ctx) }
+        catch (_: Exception) { return PaymentCaptureStatus(readError = STATE_READ_ERROR) }
         fun long(key: String) = values[key]?.toLongOrNull() ?: 0L
         return PaymentCaptureStatus(
             enabled = values["enabled"] == "true",
@@ -161,16 +183,22 @@ object CaptureStore {
         } else emptyList()
         val known = HashMap<String, String>()
         rows.forEach { row -> val parts = row.split('\t'); if (parts.size >= 2) known[parts[0]] = parts[1] }
-        val allIdentities = (identities + legacy).distinct()
-        val existing = allIdentities.firstNotNullOfOrNull { known[it] }
+        val orderedIdentities = (identities + legacy).distinct()
+        val allIdentities = orderedIdentities.sorted()
+        // Preserve primary-identity precedence; sorting is only for the canonical receipt.
+        val existing = orderedIdentities.firstNotNullOfOrNull { known[it] }
         val owner = existing ?: pending.id
-        // Even duplicate/enrichment events retain the full payload and new identities. A bounded
-        // capture cache must not be the only place holding a transaction alias.
+        // Every distinct full payload/identity set must reach Room, including merchant and
+        // transaction enrichment. Only exact repeats can skip the journal. This cache is bounded;
+        // after eviction Room remains the durable identity authority.
         val record = JSONObject().put("kind", "payment").put("id", owner)
             .put("cents", pending.cents).put("merchant", pending.merchant).put("source", pending.source)
             .put("date", pending.date).put("time", pending.time)
             .put("identities", JSONArray(allIdentities))
-            .put("legacy", JSONArray((legacy + owner).distinct()))
+            .put("legacy", JSONArray((legacy + owner).distinct().sorted()))
+        val serialized = record.toString()
+        val payloadKey = "payload:" + digest(serialized)
+        if (known[payloadKey] == owner) return@locked Commit.DUPLICATE
         RandomAccessFile(file(ctx, QUEUE), "rw").use { queue ->
             val length = queue.length()
             if (length > 0) {
@@ -180,10 +208,11 @@ object CaptureStore {
                 if (queue.readByte().toInt() != 10) queue.writeByte(10)
             }
             queue.seek(queue.length())
-            queue.write((record.toString() + "\n").toByteArray(Charsets.UTF_8))
+            queue.write((serialized + "\n").toByteArray(Charsets.UTF_8))
             queue.fd.sync()
         }
-        val fresh = allIdentities.filter { it !in known }
+        // Publish the payload receipt only after fsync. A failed append must remain retryable.
+        val fresh = allIdentities.filter { it !in known } + payloadKey
         if (fresh.isNotEmpty()) {
             val now = System.currentTimeMillis()
             val merged = (rows + fresh.map { "$it\t$owner\t$now" }).takeLast(MAX_SEEN)
@@ -223,13 +252,56 @@ object CaptureStore {
     }
 
     fun finishBatch(ctx: Context, batch: File, keep: List<String>) = locked(ctx) {
+        finishBatchLocked(ctx, batch, keep)
+    }
+
+    private fun finishBatchLocked(ctx: Context, batch: File, keep: List<String>) {
+        val values = load(ctx)
+        val queued = file(ctx, QUEUE).takeIf { it.exists() }?.useLines { lines -> lines.count { it.isNotBlank() } } ?: 0
         if (keep.isEmpty()) check(!batch.exists() || batch.delete()) { "Cannot finish capture batch" }
         else atomicWrite(batch) { it.write((keep.joinToString("\n") + "\n").toByteArray(Charsets.UTF_8)) }
-        val values = load(ctx)
         values["last_drain"] = System.currentTimeMillis().toString()
-        val queued = file(ctx, QUEUE).takeIf { it.exists() }?.useLines { lines -> lines.count { it.isNotBlank() } } ?: 0
         values["queued"] = (keep.size + queued).toString()
         save(ctx, values)
+    }
+
+    private fun batchLines(ctx: Context): List<String> {
+        val batch = file(ctx, BATCH)
+        if (!batch.exists() && !File(batch.path + ".bak").exists()) return emptyList()
+        return AtomicFile(batch).openRead().bufferedReader().use { it.readLines() }.filter { it.isNotBlank() }
+    }
+
+    private fun queueStatus(lines: List<String>): CaptureQueueStatus {
+        val failed = lines.mapNotNull { line -> CaptureQueueCodec.failureReason(line)?.let { line to it } }
+        return CaptureQueueStatus(
+            failedCount = failed.size,
+            malformedCount = failed.count { it.second == CaptureQueueCodec.MALFORMED },
+            storageCount = failed.count { it.second == CaptureQueueCodec.STORAGE },
+            confirmationToken = if (failed.isEmpty()) "" else digest(failed.joinToString("\n") { it.first })
+        )
+    }
+
+    fun queueStatus(ctx: Context): CaptureQueueStatus = try {
+        locked(ctx) { queueStatus(batchLines(ctx)) }
+    } catch (_: Exception) { CaptureQueueStatus(readError = QUEUE_READ_ERROR) }
+
+    /** Call only while holding the drain mutex + OS lock. Normal queued arrivals are never read
+     * for deletion; valid unprocessed rows in a crash-recovered batch are also retained. */
+    internal fun discardFailed(ctx: Context, expected: CaptureQueueStatus): Int = locked(ctx) {
+        check(expected.readError.isEmpty() && expected.failedCount > 0 && expected.confirmationToken.isNotEmpty()) {
+            "失败队列无法确认，请刷新后重试"
+        }
+        val lines = batchLines(ctx)
+        val current = queueStatus(lines)
+        check(current.confirmationToken == expected.confirmationToken && current.failedCount == expected.failedCount) {
+            "失败队列已变化，请重新确认"
+        }
+        val keep = lines.filter { CaptureQueueCodec.failureReason(it) == null }
+        // Invalidate receipts before discarding data so a future redelivery can be captured.
+        // Clearing this bounded optimization is safe: Room still owns durable identity dedup.
+        atomicWrite(file(ctx, SEEN)) { }
+        finishBatchLocked(ctx, file(ctx, BATCH), keep)
+        current.failedCount
     }
 
     fun refuse(ctx: Context, reason: String) = update(ctx) { it["refused"] = reason }
@@ -259,6 +331,61 @@ object CaptureStore {
     }
 
     const val CAPTURED = "已加入待确认"
+    const val STATE_READ_ERROR = "采集状态读取失败，请稍后重试"
+    const val QUEUE_READ_ERROR = "失败队列读取失败，数量暂不可用，请稍后重试"
+
+    private fun digest(value: String): String =
+        MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+}
+
+/**
+ * Failed rows stay in the same atomic batch, avoiding a second file that could drift after a
+ * crash. The envelope retains the original parsed payment for retry, never exception messages.
+ * Old unwrapped malformed rows are recognized too; valid unprocessed rows are not failures.
+ */
+internal object CaptureQueueCodec {
+    const val MALFORMED = "malformed"
+    const val STORAGE = "storage"
+    private const val FAILED = "capture_failure"
+
+    data class Entry(val id: String, val merchant: String, val pending: PendingPayment?,
+                     val identities: List<String> = emptyList(), val legacy: List<String> = emptyList())
+
+    fun payload(line: String): String {
+        val row = JSONObject(line)
+        return if (row.optString("kind") == FAILED) row.getString("payload") else line
+    }
+
+    fun failed(line: String, reason: String): String =
+        JSONObject().put("kind", FAILED).put("reason", reason).put("payload", line).toString()
+
+    fun failureReason(line: String): String? = try {
+        val row = JSONObject(line)
+        if (row.optString("kind") == FAILED) {
+            if (row.optString("reason") == STORAGE) STORAGE else MALFORMED
+        } else { decode(line); null }
+    } catch (_: Exception) { MALFORMED }
+
+    fun decode(line: String): Entry {
+        val row = JSONObject(line)
+        val id = row.getString("id").also { require(it.isNotBlank()) }
+        val merchant = row.getString("merchant")
+        if (row.optString("kind") == "merchant") return Entry(id, merchant, null)
+        require(row.optString("kind") == "payment")
+        val cents = row.getLong("cents").also { require(it > 0) }
+        val source = row.getString("source").also { require(it.isNotBlank()) }
+        val date = row.getString("date").also { java.time.LocalDate.parse(it) }
+        val time = row.getString("time").also { java.time.LocalTime.parse(it) }
+        return Entry(id, merchant, PendingPayment(id, cents, merchant, source, date, time),
+            strings(row, "identities"), strings(row, "legacy"))
+    }
+
+    private fun strings(row: JSONObject, key: String): List<String> {
+        if (!row.has(key)) return emptyList() // Old journal rows predate identity arrays.
+        val array = row.getJSONArray(key)
+        return (0 until array.length()).map { array.getString(it).also { value -> require(value.isNotBlank()) } }
+    }
 }
 
 /** User facing switch and session, stored in [CaptureStore] so both processes read one value. */

@@ -31,10 +31,38 @@ data class DailyRecord(
 data class CustomCategory(@PrimaryKey val name: String)
 
 @Entity(tableName = "payments")
-data class PendingPayment(@PrimaryKey val id: String, val cents: Long, val merchant: String, val source: String, val date: String, val time: String, val status: String = "pending")
+data class PendingPayment(@PrimaryKey val id: String, val cents: Long, val merchant: String, val source: String, val date: String, val time: String, val status: String = "pending", @ColumnInfo(defaultValue = "'其他'") val category: String = "其他")
 
 @Dao
 interface RecordDao {
+    @Query("SELECT * FROM categories") suspend fun allCategories():List<CustomCategory>
+    @Query("SELECT * FROM payments") suspend fun allPayments():List<PendingPayment>
+    @Query("SELECT * FROM payment_identities") suspend fun allIdentities():List<PaymentIdentity>
+    @Transaction suspend fun backupSnapshot():BackupData = BackupData(4, allRecords(), allCategories(), allSubscriptions(),
+        allSubscriptionPayments(), allFoodEntries().map { BackupFood(it.foodId,it.expenseId,it.ownsExpense,photoPath=it.photoPath) }, allPayments(), allIdentities())
+    @Transaction suspend fun mergeBackup(data:BackupData):RestoreResult = Backup.merge(this,data)
+    @Query("UPDATE payments SET cents=:cents,merchant=:merchant,date=:date,time=:time,category=:category WHERE id=:id AND status='pending'")
+    suspend fun editPaymentRow(id:String,cents:Long,merchant:String,date:String,time:String,category:String):Int
+    @Transaction suspend fun updatePending(p:PendingPayment):Boolean {
+        require(p.cents>0) { "金额需大于零" }
+        require(p.merchant.isNotBlank() && p.merchant.length<=200) { "请填写商户名称（最多200字）" }
+        require(java.time.LocalDate.parse(p.date)<=java.time.LocalDate.now()) { "日期不能晚于今天" }
+        java.time.LocalTime.parse(p.time)
+        val parent=p.category.substringBefore(" / ")
+        val child=p.category.substringAfter(" / ","")
+        require(parent in ExpenseCategories.groups && (child.isEmpty() || child in ExpenseCategories.groups.getValue(parent))) { "请选择有效分类" }
+        return editPaymentRow(p.id,p.cents,p.merchant.trim(),p.date,p.time,p.category)==1
+    }
+    @Transaction suspend fun confirmMany(ids:List<String>):Int {
+        var count=0
+        ids.distinct().forEach { id -> payment(id)?.takeIf { it.status=="pending" }?.let { confirm(id,it.category);count++ } }
+        return count
+    }
+    @Transaction suspend fun ignoreMany(ids:List<String>):Int {
+        var count=0
+        ids.distinct().forEach { count+=resolve(it,"ignored") }
+        return count
+    }
     @Query("SELECT * FROM records") suspend fun allRecords():List<DailyRecord>
     @Query("SELECT * FROM food_entries") suspend fun allFoodEntries():List<FoodEntry>
     @Query("SELECT * FROM subscriptions") suspend fun allSubscriptions():List<Subscription>
@@ -109,11 +137,12 @@ interface RecordDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun addPayment(payment: PendingPayment): Long
     @Query("UPDATE payments SET status = :status WHERE id = :id AND status = 'pending'") suspend fun resolve(id: String, status: String): Int
     @Query("DELETE FROM payments WHERE id = :id") suspend fun deletePending(id: String)
-    @Transaction suspend fun confirm(id: String, category: String = "其他") {
+    @Transaction suspend fun confirm(id: String, category: String = "") {
         val p = payment(id) ?: return
         if (resolve(id, "confirmed") == 1) {
-            val main=ExpenseCategories.main(category.substringBefore(" / "))
-            val child=category.substringAfter(" / ","").takeIf {it in ExpenseCategories.groups[main].orEmpty()}.orEmpty()
+            val selected=category.ifBlank { p.category }
+            val main=ExpenseCategories.main(selected.substringBefore(" / "))
+            val child=selected.substringAfter(" / ","").takeIf {it in ExpenseCategories.groups[main].orEmpty()}.orEmpty()
             save(DailyRecord("payment-$id", "EXPENSE", p.date, p.time, main, "${p.merchant} · ${p.source}通知识别", p.cents,extra=child))
         }
     }
@@ -130,10 +159,15 @@ interface RecordDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun addCategory(category: CustomCategory)
 }
 
-@Database(entities = [DailyRecord::class, CustomCategory::class, PendingPayment::class, Subscription::class, SubscriptionPayment::class, FoodEntry::class, PaymentIdentity::class], version = 5, exportSchema = false)
+@Database(entities = [DailyRecord::class, CustomCategory::class, PendingPayment::class, Subscription::class, SubscriptionPayment::class, FoodEntry::class, PaymentIdentity::class], version = 6, exportSchema = false)
 abstract class DailyDatabase : RoomDatabase() {
     abstract fun records(): RecordDao
     companion object {
+        val MIGRATION_5_6 = object : Migration(5,6) {
+            override fun migrate(db:SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE payments ADD COLUMN category TEXT NOT NULL DEFAULT '其他'")
+            }
+        }
         val MIGRATION_4_5 = object : Migration(4,5) {
             override fun migrate(db:SupportSQLiteDatabase) {
                 db.execSQL("CREATE TABLE IF NOT EXISTS payment_identities (identity TEXT NOT NULL PRIMARY KEY, paymentId TEXT NOT NULL)")
@@ -160,7 +194,7 @@ abstract class DailyDatabase : RoomDatabase() {
         @Volatile private var instance: DailyDatabase? = null
         fun get(context: Context): DailyDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(context.applicationContext, DailyDatabase::class.java, "daily.db")
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5).build().also { instance = it }
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6).build().also { instance = it }
         }
     }
 }

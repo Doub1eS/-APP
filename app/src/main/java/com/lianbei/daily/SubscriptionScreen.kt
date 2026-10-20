@@ -33,7 +33,7 @@ private fun cash(c:Long)="¥${RecordRules.money(c)}"
  val scope=rememberCoroutineScope();val context=LocalContext.current
  val snackbar=remember {SnackbarHostState()}
  var mode by rememberSaveable {mutableStateOf("列表")}
- var filter by rememberSaveable {mutableStateOf("启用")}
+ var filter by rememberSaveable {mutableStateOf(SubscriptionFilter.ACTIVE.name)}
  var monthText by rememberSaveable {mutableStateOf(YearMonth.now().toString())}
  val month=YearMonth.parse(monthText);val today=LocalDate.now()
  var editingId by rememberSaveable {mutableStateOf<String?>(null)}
@@ -48,7 +48,7 @@ private fun cash(c:Long)="¥${RecordRules.money(c)}"
  val active=subscriptions.filter {it.active}
  fun total(from:LocalDate,to:LocalDate)=active.sumOf {s->SubscriptionRules.dates(s,from,to).size*s.cents}
  val current=YearMonth.from(today)
- fun mutate(action:suspend ()->Unit) {if(busy)return;busy=true;error="";scope.launch {try {action()}catch(_:Exception){error="操作失败，请检查记录后重试。"}finally {busy=false}}}
+ fun mutate(action:suspend ()->Unit) {if(busy)return;busy=true;error="";scope.launch {try {action();SubscriptionReminders.refresh(context)}catch(_:Exception){error="操作失败，请检查记录后重试。"}finally {busy=false}}}
  fun openLink(s:Subscription) {
   val notice=try {check(SubscriptionRules.validLink(s.paymentUrl)&&s.paymentUrl.isNotBlank());context.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(s.paymentUrl)).addCategory(Intent.CATEGORY_BROWSABLE));"完成缴费后，请返回确认付款。"}
   catch(_:Exception){"无法打开缴费链接，请检查网址或安装浏览器。"}
@@ -77,17 +77,22 @@ private fun cash(c:Long)="¥${RecordRules.money(c)}"
     }
    }
   }
+  item {SubscriptionReminderPanel()}
   if(message.isNotBlank()) item {Text(message,color=MaterialTheme.colorScheme.primary)}
   if(error.isNotBlank()&&!editor&&confirming==null) item {Text(error,color=MaterialTheme.colorScheme.error)}
   item {FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){listOf("列表","日历","统计").forEach {tab->FilterChip(mode==tab,{mode=tab;selectedDate=null},label={Text(tab)})}}}
   if(mode=="列表") {
-   item {FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){listOf("启用","停用","全部").forEach {f->FilterChip(filter==f,{filter=f},label={Text(f)})}}}
-   val shown=subscriptions.filter {filter=="全部" || it.active==(filter=="启用")}.sortedBy {SubscriptionRules.next(it,today) ?: LocalDate.MAX}
-   if(shown.isEmpty()) item {Panel {Text(if(subscriptions.isEmpty())"还没有订阅记录" else "此分类下暂无订阅");Text("点击上方「添加订阅」，记录金额、周期和缴费链接。")}}
+   val selectedFilter=SubscriptionFilter.entries.find {it.name==filter} ?: SubscriptionFilter.ACTIVE
+   item {FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){SubscriptionFilter.entries.forEach {f->FilterChip(selectedFilter==f,{filter=f.name},label={Text(f.label)},modifier=Modifier.testTag("subscription-filter-${f.name}"))}}}
+   val shown=selectedFilter.apply(subscriptions,today).sortedBy {SubscriptionRules.next(it,today) ?: LocalDate.MAX}
+   if(shown.isEmpty()) item {Panel {
+    Text(if(subscriptions.isEmpty())"还没有订阅记录" else selectedFilter.emptyText)
+    Text(if(subscriptions.isEmpty())"点击上方「添加订阅」，记录金额、周期和缴费链接。" else "可切换筛选查看其他订阅。")
+   }}
    items(shown,key={it.id}) {s->
     val next=SubscriptionRules.next(s,today)
     val paid=next?.let {d->links.any {it.subscriptionId==s.id&&it.dueDate==d.toString()}} ?: false
-    Card(colors=CardDefaults.cardColors(containerColor=subscriptionColors[s.color.coerceIn(0,3)].copy(alpha=.12f))) {
+    Card(modifier=Modifier.testTag("subscription-card-${s.id}"),colors=CardDefaults.cardColors(containerColor=subscriptionColors[s.color.coerceIn(0,3)].copy(alpha=.12f))) {
      Column(Modifier.fillMaxWidth().padding(20.dp),verticalArrangement=Arrangement.spacedBy(10.dp)) {
       Text(s.name,style=MaterialTheme.typography.titleLarge,fontWeight=FontWeight.Bold)
       Text("${SubscriptionRules.cycles[s.cycle]} · ${s.category} · ${if(s.active)"启用中" else "已停用"}")

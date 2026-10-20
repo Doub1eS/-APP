@@ -19,19 +19,17 @@ import androidx.compose.ui.platform.testTag
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
 import java.time.LocalDate
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
 
 @Composable
-fun DailyApp(dao: RecordDao, openPayments: Boolean = false, onPaymentsConsumed: () -> Unit = {}) {
+fun DailyApp(dao: RecordDao, openPayments: Boolean = false, onPaymentsConsumed: () -> Unit = {},
+    openSubscriptions: Boolean = false, onSubscriptionsConsumed: () -> Unit = {}) {
     var page by rememberSaveable { mutableStateOf("今天") }
     var paymentInbox by rememberSaveable { mutableStateOf(openPayments) }
     LaunchedEffect(openPayments) { if (openPayments) paymentInbox = true }
+    LaunchedEffect(openSubscriptions) { if(openSubscriptions) {page="订阅";paymentInbox=false;onSubscriptionsConsumed()} }
     val pendingPayments by dao.pending().collectAsStateWithLifecycle(emptyList())
     val foodRows by dao.foodEntries().collectAsStateWithLifecycle(initialValue = null)
     val foodEntries = foodRows.orEmpty()
@@ -53,28 +51,11 @@ fun DailyApp(dao: RecordDao, openPayments: Boolean = false, onPaymentsConsumed: 
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
     val context = LocalContext.current
-    suspend fun cleanPhotos() {
-        val paths=dao.allFoodEntries().map {it.photoPath}.toSet()
-        withContext(Dispatchers.IO){FoodPhotos.clean(context,paths)}
+    LaunchedEffect(subscriptions,subscriptionPayments,all.filter{it.kind=="EXPENSE"}.map{it.id}) {
+        SubscriptionReminders.refresh(context)
     }
-    val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
-        if (uri != null) scope.launch {
-            try {
-                val content = withContext(Dispatchers.IO) { JSONObject().put("version", 3).put("foodEntries", JSONArray().apply {
-                    foodEntries.forEach { f -> put(JSONObject().put("foodId",f.foodId).put("expenseId",f.expenseId ?: JSONObject.NULL).put("ownsExpense",f.ownsExpense).put("photoBase64",FoodPhotos.export(context,f.photoPath))) }
-                }).put("subscriptions", JSONArray().apply {
-                    subscriptions.forEach { s -> put(JSONObject().put("id",s.id).put("name",s.name).put("cents",s.cents).put("cycle",s.cycle).put("startDate",s.startDate).put("category",s.category).put("note",s.note).put("paymentUrl",s.paymentUrl).put("color",s.color).put("active",s.active)) }
-                }).put("subscriptionPayments", JSONArray().apply {
-                    subscriptionPayments.forEach { p -> put(JSONObject().put("subscriptionId",p.subscriptionId).put("dueDate",p.dueDate).put("recordId",p.recordId)) }
-                }).put("records", JSONArray().apply {
-                    all.forEach { r -> put(JSONObject().put("id", r.id).put("kind", r.kind).put("date", r.date).put("time", r.time).put("title", r.title).put("detail", r.detail).put("value", r.value ?: JSONObject.NULL).put("extra", r.extra).put("createdAt", r.createdAt)) }
-                }).put("categories", JSONArray(categories.map { it.name })).toString(2) }
-                withContext(Dispatchers.IO) {
-                    checkNotNull(context.contentResolver.openOutputStream(uri)).bufferedWriter().use { it.write(content) }
-                }
-                snackbar.showSnackbar("记录已导出")
-            } catch (_: Exception) { snackbar.showSnackbar("导出失败，请重试") }
-        }
+    suspend fun cleanPhotos() {
+        FoodPhotos.cleanStored(context,dao)
     }
     val entries = all.filter { it.date == dateText }
     Scaffold(snackbarHost = { SnackbarHost(snackbar) }, bottomBar = {
@@ -96,11 +77,7 @@ fun DailyApp(dao: RecordDao, openPayments: Boolean = false, onPaymentsConsumed: 
                         Text("${all.size} 条记录",style=MaterialTheme.typography.headlineMedium,fontWeight=FontWeight.Bold)
                         Text("${all.map {it.date}.distinct().size} 天留下足迹 · ${categories.size} 个自定义类别")
                     } }
-                    item { Panel {
-                        Text("数据与备份",style=MaterialTheme.typography.titleLarge)
-                        Text("记录保存在这台设备，无需登录。导出的 JSON 可保存和查看，目前不支持导入。")
-                        Button(onClick={export.launch("练呗记录-${LocalDate.now()}.json")}) {Text("导出记录")}
-                    } }
+                    item { BackupPanel(dao) }
                     item { Panel {
                         Text("示例数据",style=MaterialTheme.typography.titleLarge)
                         Text("添加最近7天的日常和3条订阅，方便查看页面。示例会计入统计，并标注为示例；可随时清除。")
@@ -170,9 +147,11 @@ fun DailyApp(dao: RecordDao, openPayments: Boolean = false, onPaymentsConsumed: 
                 saving=true
                 scope.launch {
                     try {
-                        val savedPhoto=withContext(Dispatchers.IO){FoodPhotos.commit(context,photo)}
-                        dao.saveFood(record,savedPhoto,cents,existing)
-                        withContext(Dispatchers.IO){FoodPhotos.discardDraft(context,photo)}
+                        FoodPhotos.withLifecycleLock {
+                            val savedPhoto=FoodPhotos.commit(context,photo)
+                            dao.saveFood(record,savedPhoto,cents,existing)
+                            FoodPhotos.discardDraft(context,photo)
+                        }
                         cleanPhotos();saving=false;selected=null;snackbar.showSnackbar("已记录")
                     }
                     catch(e:Exception){saveError=e.message ?: "保存失败，请重试";runCatching {cleanPhotos()}}

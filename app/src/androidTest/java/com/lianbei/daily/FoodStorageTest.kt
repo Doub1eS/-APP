@@ -29,9 +29,20 @@ class FoodStorageTest {
   val name="food-v3-migration.db";context.deleteDatabase(name)
   val old=Room.databaseBuilder(context,DailyDatabase::class.java,name).build()
   old.records().save(food());old.records().saveSubscription(Subscription("old-sub","旧订阅",1500,"MONTH","2026-01-01"));old.close()
-  context.openOrCreateDatabase(name,0,null).use {it.execSQL("DROP TABLE food_entries");it.version=3}
-  val upgraded=Room.databaseBuilder(context,DailyDatabase::class.java,name).addMigrations(DailyDatabase.MIGRATION_3_4, DailyDatabase.MIGRATION_4_5).build()
-  try {assertEquals("牛肉面",upgraded.records().allRecords().single().detail);assertEquals("旧订阅",upgraded.records().allSubscriptions().single().name);assertTrue(upgraded.records().allFoodEntries().isEmpty())}
+  context.openOrCreateDatabase(name,0,null).use {
+   it.execSQL("DROP TABLE food_entries")
+   it.execSQL("DROP TABLE payment_identities")
+   it.execSQL("DROP TABLE payments")
+   it.execSQL("CREATE TABLE payments (id TEXT NOT NULL PRIMARY KEY, cents INTEGER NOT NULL, merchant TEXT NOT NULL, source TEXT NOT NULL, date TEXT NOT NULL, time TEXT NOT NULL, status TEXT NOT NULL)")
+   it.execSQL("INSERT INTO payments VALUES ('legacy',1200,'旧商户','微信','2026-01-01','12:00','pending')")
+   it.version=3
+  }
+  val upgraded=Room.databaseBuilder(context,DailyDatabase::class.java,name).addMigrations(DailyDatabase.MIGRATION_3_4, DailyDatabase.MIGRATION_4_5, DailyDatabase.MIGRATION_5_6).build()
+  try {assertEquals("牛肉面",upgraded.records().allRecords().single().detail);assertEquals("旧订阅",upgraded.records().allSubscriptions().single().name);assertTrue(upgraded.records().allFoodEntries().isEmpty())
+   assertEquals("其他",upgraded.records().payment("legacy")?.category)
+   assertEquals("旧商户",upgraded.records().payment("legacy")?.merchant)
+   assertEquals(1200L,upgraded.records().payment("legacy")?.cents)
+  }
   finally {upgraded.close();context.deleteDatabase(name)}
  }
  @Test fun demoDataIsIdempotentAndCleanupPreservesPersonalRecords()=runBlocking {

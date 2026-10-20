@@ -40,9 +40,9 @@ class RedesignTest {
             db.records().addPayment(PendingPayment("preview",2680,"街角咖啡","微信",today.toString(),"09:20"))
         }
         val dao=object:RecordDao by db.records() {
-            override suspend fun confirm(id:String,category:String) {
+            override suspend fun confirmMany(ids:List<String>):Int {
                 if(failPayments) throw IllegalStateException("Test write failure")
-                db.records().confirm(id,category)
+                return db.records().confirmMany(ids)
             }
         }
         compose.setContent { LianbeiTheme {if(visible.value) DailyApp(dao)} }

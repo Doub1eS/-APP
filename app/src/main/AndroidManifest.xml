@@ -17,6 +17,14 @@
                 android:value="User enabled continuous payment notification capture with visible status and stop controls; system force-stop can interrupt capture." />
         </service>
         <receiver android:name=".PaymentActionReceiver" android:exported="false" />
+        <receiver android:name=".SubscriptionReminderReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+                <action android:name="android.intent.action.TIME_SET" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
         <receiver android:name=".PaymentBootReceiver" android:process=":capture" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
