@@ -93,20 +93,7 @@ class DebugCaptureReceiver : BroadcastReceiver() {
                     }
                 }
             }
-            "com.lianbei.daily.DEBUG_DRAIN" -> {
-                val result = goAsync()
-                scope.launch {
-                    try {
-                        val count = CaptureDrain.drain(context, DailyDatabase.get(context).records())
-                        Log.i(TAG, "drain applied=$count")
-                        append(context, "drain applied=$count")
-                    } catch (e: Exception) {
-                        Log.e(TAG, "drain failed", e)
-                    } finally {
-                        result.finish()
-                    }
-                }
-            }
+
         }
     }
 

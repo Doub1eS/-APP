@@ -2,20 +2,22 @@
 
 更新：2026-10-20。本文件记录的是**已经实测到的结论**和**尚未验证的部分**，不把未测项写成已实现。
 
-## 本轮改动（代码已实现）
+> 0.7.1复核注：下文真机记录来自488b9f9提交，当前无无线调试，未独立复现。关于HyperOS清理、恢复手段和内存数字仅适用于该次记录的设备/设置；不能外推所有HyperOS配置。“一键修复”只能打开设置，重新授权仍需用户操作。通知可见性不能单独证明服务活跃，0.7.1已替换状态判断；完整改动与本轮证据见[capture-v7.1-verification.md](capture-v7.1-verification.md)。
+
+## 0.7.0原始改动记录（0.7.1差异见复核文档）
 
 - 采集与界面拆进程：`PaymentListener` 与 `PaymentWatchService` 运行在 `:capture` 进程，不加载 Room、不加载 Compose。
 - 单写者存储：`:capture` 进程只把识别结果追加到 `files/capture-queue.jsonl`；默认（界面）进程是唯一的 Room 写入方，前台每 2 秒 drain 一次，通知按钮操作前也会先 drain。
 - 跨进程状态：开关、会话、连接状态、诊断原因、去重身份、队列计数写在 `files/capture-state.properties`，用 `capture.lock`（OS 文件锁）保护读改写；不再依赖 SharedPreferences 与内存 StateFlow。
 - 去重：`:capture` 进程用 `files/capture-seen.tsv` 记录身份哈希，先查后写；重复通知只补商户，不新增账目。重复通知里**新出现的身份**（例如后补的交易号）也会被记下，避免换 key 重发时二次入账。
 - 常驻前台服务 `PaymentWatchService`（`specialUse` 类型、`START_STICKY`、`stopWithTask=false`），并在 `BOOT_COMPLETED`/`MY_PACKAGE_REPLACED` 时恢复；断线时 `requestRebind` 最多重试 4 次。
-- 状态不再"猜测"：界面读状态文件，并用前台服务通知是否存在判断 `:capture` 进程是否真的活着（进程死了通知一定消失），避免把上次进程的残留值当成"正在监听"。
+- 0.7.0曾以常驻通知可见性核验状态；复核发现通知权限会影响可见性，这个判断不足以证明监听活跃。0.7.1改为检查保存的服务所属PID与系统当前采集进程，并由连接回调更新状态。
 - 通知点击真正打开待确认页（补了 `onNewIntent`）；此前应用在前台时点通知不会打开。
 - 诊断写入节流（同来源同原因 30 秒内不重复写盘）；隐藏内容正则从每次编译改为常量。
 
 ## 已实测结论（小米15 / HyperOS 3.0 / Android 16 / 24129PN74C）
 
-### 1. HyperOS 的"从最近任务划走"等于强行停止整个应用
+### 1. 该次配置下划走触发了整个应用的强行停止
 
 用户实际划走时抓到的系统日志：
 
@@ -42,7 +44,7 @@ NotificationListeners: 0 notification listener binding died: ComponentInfo{com.l
 
 唯一确认有效的方式是**变更系统的"通知使用权"授权集合**：`cmd notification disallow_listener` + `allow_listener`（等价于用户在设置里关闭再开启练呗）。重启手机同样会重新绑定。
 
-因此"划走后继续监听"在 HyperOS 上无法用应用侧手段兜住；可行的产品做法只有三条：**降低发生概率（锁定任务/省电无限制/自启动）、如实显示断开、提供一次点击就能修复的入口**。
+该次测试中应用侧恢复未成功。后续应分别验证锁定任务、省电限制、自启动设置的影响，并如实显示断开、提供系统设置入口；重新授权仍需用户操作。
 
 ### 3. 拆分进程确实有效（除划走外的场景）
 
@@ -58,14 +60,14 @@ NotificationListeners: 0 notification listener binding died: ComponentInfo{com.l
 | `com.lianbei.daily:capture`（仅监听+常驻服务，无 Room/Compose） | 约 62 MB | 约 148 MB |
 | `com.lianbei.daily`（界面打开，含 Compose 与 Room） | 约 122 MB | 约 233 MB |
 
-结论：后台常驻开销约为界面进程的一半，划走场景下如果只有 `:capture` 存活约 62 MB PSS。这只是单次快照，不能当作峰值或独占内存结论；事件前后增量、CPU 占用、锁屏 8 小时曲线尚未测。
+该次快照的采集进程PSS约为界面进程的一半。只有采集进程存活时才可单独计算其开销；上文划走测试中两个进程均被杀，不能把62 MB描述成划走后的实测占用。这只是单次快照，不能当作峰值；事件前后增量、CPU占用、长时间锁屏曲线尚未测。
 
 ## 尚未验证（不要在文档里写成已通过）
 
 - 锁定最近任务卡片、省电策略=无限制、自启动允许之后，划走是否不再 force-stop（需要用户在真机上配合一次实验）。
 - 锁屏 30 分钟以上、夜间长时间静置后，付款通知能否稳定收到。
 - 支付宝真实付款通知、退款/转账/红包真实样本。
-- 界面类设备测试（`DailyAppTest` / `ExpenseCategoryUiTest` / `RedesignTest`）在本机报 `Process crashed`，原因未定位，不能声称通过。
+- 0.7.0记录的界面测试曾报 `Process crashed`；0.7.1在冷启动Android 15模拟器上三组均通过，旧环境崩溃原因仍未完全确认，不能外推真机结果。
 - `connectedAndroidTest` 在本机不可用：MIUI 拦截测试包安装，且 UTP 在安装失败时卸载了被测应用。
 
 ## 已跑的测试（本机真实设备）

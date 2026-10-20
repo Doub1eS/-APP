@@ -35,11 +35,15 @@ class DebugDbReceiver : BroadcastReceiver() {
             }
             return
         }
-        if (action != "com.lianbei.daily.DEBUG_DB") return
+        if (action !in setOf("com.lianbei.daily.DEBUG_DB", "com.lianbei.daily.DEBUG_DRAIN")) return
         val result = goAsync()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
                 val dao = DailyDatabase.get(context).records()
+                if (action == "com.lianbei.daily.DEBUG_DRAIN") {
+                    CaptureDrain.drain(context, dao)
+                    return@launch
+                }
                 val pending = dao.pending().first()
                 val all = dao.observeAll().first()
                 val text = buildString {

@@ -1,6 +1,8 @@
 package com.lianbei.daily
 
 import android.content.Context
+import android.util.AtomicFile
+import java.io.FileOutputStream
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -68,7 +70,7 @@ object CaptureStore {
     private fun load(ctx: Context): MutableMap<String, String> {
         val properties = Properties()
         val target = file(ctx, STATE)
-        if (target.exists()) runCatching { target.inputStream().use { properties.load(it) } }
+        if (target.exists() || File(target.path + ".bak").exists()) AtomicFile(target).openRead().use { properties.load(it) }
         return properties.stringPropertyNames().associateWith { properties.getProperty(it) }.toMutableMap()
     }
 
@@ -76,12 +78,14 @@ object CaptureStore {
         val properties = Properties()
         values.forEach { (key, value) -> properties.setProperty(key, value) }
         val target = file(ctx, STATE)
-        val temp = File(target.parentFile, "$STATE.tmp")
-        temp.outputStream().use { properties.store(it, null) }
-        if (!temp.renameTo(target)) {
-            target.delete()
-            temp.renameTo(target)
-        }
+        atomicWrite(target) { properties.store(it, null) }
+    }
+
+    private fun atomicWrite(target: File, write: (FileOutputStream) -> Unit) {
+        val atomic = AtomicFile(target)
+        val stream = atomic.startWrite()
+        try { write(stream); atomic.finishWrite(stream) }
+        catch (e: Exception) { atomic.failWrite(stream); throw e }
     }
 
     fun state(ctx: Context): Map<String, String> = locked(ctx) { load(ctx) }
@@ -94,7 +98,9 @@ object CaptureStore {
     /** Same as [update] but skips the file write when [block] reports no change. */
     fun updateIf(ctx: Context, block: (MutableMap<String, String>) -> Boolean) = locked(ctx) {
         val values = load(ctx)
-        if (block(values)) save(ctx, values)
+        val changed = block(values)
+        if (changed) save(ctx, values)
+        changed
     }
 
     fun snapshot(ctx: Context): PaymentCaptureStatus {
@@ -139,55 +145,53 @@ object CaptureStore {
         }
     }
 
-    /** Marks the identities as handled and reports the payment they already belong to. */
-    fun claim(ctx: Context, identities: List<String>, paymentId: String): String? = locked(ctx) {
+    enum class Commit { NEW, DUPLICATE, DISABLED }
+
+    /**
+     * Serialize opt-in validation, journal append and dedup publication across both processes.
+     * The durable queue always precedes the index. A crash can replay an event, never claim an
+     * event that was not queued. Room is the durable dedup authority after queue/cache eviction.
+     */
+    fun capture(ctx: Context, pending: PendingPayment, identities: List<String>, legacy: List<String>, session: String): Commit = locked(ctx) {
+        val values = load(ctx)
+        if (values["enabled"] != "true" || values["session"].orEmpty() != session) return@locked Commit.DISABLED
         val target = file(ctx, SEEN)
-        val rows = runCatching { target.takeIf { it.exists() }?.readLines().orEmpty() }.getOrDefault(emptyList())
-            .filter { it.isNotBlank() }
+        val rows = if (target.exists() || File(target.path + ".bak").exists()) {
+            AtomicFile(target).openRead().bufferedReader().use { it.readLines() }.filter { it.isNotBlank() }
+        } else emptyList()
         val known = HashMap<String, String>()
-        rows.forEach { row ->
-            val parts = row.split('\t')
-            if (parts.size >= 2) known[parts[0]] = parts[1]
+        rows.forEach { row -> val parts = row.split('\t'); if (parts.size >= 2) known[parts[0]] = parts[1] }
+        val allIdentities = (identities + legacy).distinct()
+        val existing = allIdentities.firstNotNullOfOrNull { known[it] }
+        val owner = existing ?: pending.id
+        // Even duplicate/enrichment events retain the full payload and new identities. A bounded
+        // capture cache must not be the only place holding a transaction alias.
+        val record = JSONObject().put("kind", "payment").put("id", owner)
+            .put("cents", pending.cents).put("merchant", pending.merchant).put("source", pending.source)
+            .put("date", pending.date).put("time", pending.time)
+            .put("identities", JSONArray(allIdentities))
+            .put("legacy", JSONArray((legacy + owner).distinct()))
+        RandomAccessFile(file(ctx, QUEUE), "rw").use { queue ->
+            val length = queue.length()
+            if (length > 0) {
+                queue.seek(length - 1)
+                // Preserve a torn final record as an independent failed row; don't concatenate
+                // a new valid event onto it. Failed rows remain available for diagnosis/retry.
+                if (queue.readByte().toInt() != 10) queue.writeByte(10)
+            }
+            queue.seek(queue.length())
+            queue.write((record.toString() + "\n").toByteArray(Charsets.UTF_8))
+            queue.fd.sync()
         }
-        val existing = identities.firstNotNullOfOrNull { known[it] }
-        // A duplicate may arrive with identities the first notification did not carry (for example a
-        // transaction id that shows up in an update). They must still be remembered, otherwise a
-        // later re-post under a new notification key would create a second payment.
-        val fresh = identities.filter { it !in known }
+        val fresh = allIdentities.filter { it !in known }
         if (fresh.isNotEmpty()) {
             val now = System.currentTimeMillis()
-            val owner = existing ?: paymentId
-            val merged = rows + fresh.map { "$it\t$owner\t$now" }
-            val trimmed = if (merged.size > MAX_SEEN) merged.takeLast(MAX_SEEN) else merged
-            runCatching { target.writeText(trimmed.joinToString("\n") + "\n") }
+            val merged = (rows + fresh.map { "$it\t$owner\t$now" }).takeLast(MAX_SEEN)
+            atomicWrite(target) { it.write((merged.joinToString("\n") + "\n").toByteArray(Charsets.UTF_8)) }
         }
-        existing
-    }
-
-    fun enqueuePayment(ctx: Context, pending: PendingPayment, identities: List<String>, legacy: List<String>) = locked(ctx) {
-        val record = JSONObject()
-            .put("kind", "payment")
-            .put("id", pending.id)
-            .put("cents", pending.cents)
-            .put("merchant", pending.merchant)
-            .put("source", pending.source)
-            .put("date", pending.date)
-            .put("time", pending.time)
-            .put("identities", JSONArray(identities))
-            .put("legacy", JSONArray(legacy))
-        append(ctx, record)
-    }
-
-    fun enqueueMerchant(ctx: Context, id: String, merchant: String) = locked(ctx) {
-        append(ctx, JSONObject().put("kind", "merchant").put("id", id).put("merchant", merchant))
-    }
-
-    private fun append(ctx: Context, record: JSONObject) {
-        val target = file(ctx, QUEUE)
-        target.appendText(record.toString() + "\n")
-        val values = load(ctx)
         values["queued"] = ((values["queued"]?.toLongOrNull() ?: 0L) + 1).toString()
         save(ctx, values)
+        if (existing == null) Commit.NEW else Commit.DUPLICATE
     }
 
     /**
@@ -196,19 +200,35 @@ object CaptureStore {
      */
     fun takeBatch(ctx: Context): File? = locked(ctx) {
         val batch = file(ctx, BATCH)
-        if (batch.exists() && batch.length() > 0L) return@locked batch
         val queue = file(ctx, QUEUE)
+        if (File(batch.path + ".bak").exists()) AtomicFile(batch).openRead().close()
+        if (batch.exists() && batch.length() > 0L) {
+            if (queue.exists() && queue.length() > 0L) {
+                // Retained failures must not starve later valid payments. Replace the batch
+                // before removing the new queue; a crash between these steps only replays rows.
+                val retained = AtomicFile(batch).openRead().use { it.readBytes() }
+                atomicWrite(batch) { out ->
+                    out.write(retained)
+                    if (retained.isNotEmpty() && retained.last().toInt() != 10) out.write(10)
+                    queue.inputStream().use { it.copyTo(out) }
+                }
+                check(queue.delete()) { "Cannot finish merging capture queue" }
+            }
+            return@locked batch
+        }
         if (!queue.exists() || queue.length() == 0L) return@locked null
-        batch.delete()
-        if (queue.renameTo(batch)) batch else null
+        check(!batch.exists() || batch.delete()) { "Cannot remove empty batch" }
+        check(queue.renameTo(batch)) { "Cannot prepare capture batch" }
+        batch
     }
 
     fun finishBatch(ctx: Context, batch: File, keep: List<String>) = locked(ctx) {
-        if (keep.isEmpty()) batch.delete()
-        else batch.writeText(keep.joinToString("\n") + "\n")
+        if (keep.isEmpty()) check(!batch.exists() || batch.delete()) { "Cannot finish capture batch" }
+        else atomicWrite(batch) { it.write((keep.joinToString("\n") + "\n").toByteArray(Charsets.UTF_8)) }
         val values = load(ctx)
         values["last_drain"] = System.currentTimeMillis().toString()
-        values["queued"] = keep.size.toString()
+        val queued = file(ctx, QUEUE).takeIf { it.exists() }?.useLines { lines -> lines.count { it.isNotBlank() } } ?: 0
+        values["queued"] = (keep.size + queued).toString()
         save(ctx, values)
     }
 
@@ -216,11 +236,14 @@ object CaptureStore {
 
     /** One-time copy of the 0.6 SharedPreferences switches so upgrading keeps the user's choice. */
     fun migrateLegacy(ctx: Context) {
-        if (file(ctx, STATE).exists()) return
         val legacy = ctx.getSharedPreferences("payments", 0)
         val diagnostics = ctx.getSharedPreferences("payment_diagnostics", 0)
         if (!legacy.contains("enabled") && diagnostics.all.isEmpty()) return
-        update(ctx) { values ->
+        locked(ctx) {
+            val state = file(ctx, STATE)
+            // A recoverable AtomicFile backup is already migrated state, not a fresh install.
+            if (state.exists() || File(state.path + ".bak").exists()) return@locked
+            val values = load(ctx)
             values["enabled"] = legacy.getBoolean("enabled", false).toString()
             legacy.getString("session", null)?.let { values["session"] = it }
             val enabledAt = legacy.getLong("enabled_at", 0L)
@@ -231,6 +254,7 @@ object CaptureStore {
             }
             diagnostics.getString("source", null)?.let { values["source"] = it }
             diagnostics.getString("reason", null)?.let { values["reason"] = it }
+            save(ctx, values)
         }
     }
 

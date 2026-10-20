@@ -61,7 +61,11 @@ fun PaymentInbox(dao: RecordDao, onClose: () -> Unit) {
         onDispose { lifecycle.removeObserver(observer) }
     }
     // A payment captured while the app was closed is still waiting in the shared queue.
-    LaunchedEffect(Unit) { withContext(Dispatchers.IO) { CaptureDrain.drain(context, dao) } }
+    LaunchedEffect(Unit) {
+        try { CaptureDrain.drain(context, dao) }
+        catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (_: Exception) { error = "部分待确认记录尚未导入，请稍后重新打开；原记录已保留。" }
+    }
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(Modifier.fillMaxSize()) {
             Box(Modifier.fillMaxSize()) {
@@ -133,7 +137,7 @@ fun PaymentInbox(dao: RecordDao, onClose: () -> Unit) {
     if (consent) AlertDialog(onDismissRequest = { consent = false }, title = { Text("开启支付通知识别") }, text = {
         Text(
             "系统授权允许练呗读取通知。本功能只处理微信、支付宝的付款成功通知，提取金额、商户和时间，在本机生成待确认账目；不保存通知原文、不上传数据。聊天、退款、收款和不明确的内容会跳过。" +
-                "开启后会常驻一条低优先级通知，用来在从最近任务划走后继续采集；这个常驻通知也会占用少量后台内存，可以随时关闭识别或在设置中关闭后台常驻。可以随时关闭，或在系统设置撤销授权。"
+                "开启后会启动独立的后台采集进程，并显示低优先级常驻通知，帮助页面关闭后继续采集；系统清理或后台限制仍可能中断监听。后台进程会占用内存，可以随时关闭识别、关闭后台常驻，或在系统设置撤销授权。"
         )
     }, confirmButton = {
         TextButton(onClick = {

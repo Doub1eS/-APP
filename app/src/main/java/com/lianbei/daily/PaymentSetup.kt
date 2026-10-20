@@ -1,7 +1,7 @@
 package com.lianbei.daily
 
+import android.app.ActivityManager
 import android.app.NotificationManager
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -14,8 +14,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -26,49 +29,52 @@ fun openPaymentSetting(context: Context, intent: Intent): Boolean = runCatching 
 @Composable fun rememberCaptureStatus(intervalMs: Long = 1_000L): PaymentCaptureStatus {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
-    var status by remember { mutableStateOf(settledStatus(context, CaptureStore.snapshot(context))) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            status = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                settledStatus(context, CaptureStore.snapshot(context))
-            }
-            kotlinx.coroutines.delay(intervalMs)
-        }
-    }
-    DisposableEffect(lifecycle) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) status = settledStatus(context, CaptureStore.snapshot(context))
-        }
-        lifecycle.addObserver(observer)
-        onDispose { lifecycle.removeObserver(observer) }
+    var status by remember(context, lifecycle) { mutableStateOf(PaymentCaptureStatus()) }
+    LaunchedEffect(context, lifecycle, intervalMs) {
+        observeCaptureStatus(lifecycle, intervalMs,
+            readStatus = {
+                withContext(Dispatchers.IO) {
+                    settledStatus(context, CaptureStore.snapshot(context))
+                }
+            },
+            onStatus = { status = it })
     }
     return status
 }
 
-/**
- * The state file is written by another process, so a value left behind by a dead process would
- * claim a live connection. The watch service notification is a truthful liveness signal: it is
- * created with the foreground service and removed when the process dies.
- */
-private fun settledStatus(context: Context, status: PaymentCaptureStatus): PaymentCaptureStatus {
-    val raw = CaptureStore.state(context)
-    val alive = watchAlive(context, raw)
-    return status.copy(
-        watchRunning = status.watchRunning && alive,
-        connected = if (raw["watch"] == "true") status.connected && alive else status.connected
-    )
+internal suspend fun observeCaptureStatus(
+    lifecycle: Lifecycle,
+    intervalMs: Long,
+    readStatus: suspend () -> PaymentCaptureStatus,
+    onStatus: (PaymentCaptureStatus) -> Unit
+) {
+    lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+        while (true) {
+            onStatus(readStatus())
+            delay(intervalMs.coerceAtLeast(1L))
+        }
+    }
 }
 
-private fun watchAlive(context: Context, raw: Map<String, String>): Boolean {
-    val manager = context.getSystemService(NotificationManager::class.java)
-    val channel = runCatching { manager.getNotificationChannel(PaymentWatchService.CHANNEL) }.getOrNull()
-    val notifications = runCatching { manager.activeNotifications }.getOrNull()
-    if (notifications != null) {
-        if (notifications.any { it.id == PaymentWatchService.ID }) return true
-        // A disabled channel hides the notification, so its absence would prove nothing.
-        if (manager.areNotificationsEnabled() && channel != null && channel.importance != NotificationManager.IMPORTANCE_NONE) return false
-    }
-    return raw["watch"] == "true"
+/**
+ * Notification visibility is independent of service liveness. Match each persisted owner against
+ * the OS process list without starting or binding a service. An unavailable list means unknown
+ * and is conservatively represented by false in the existing status fields.
+ */
+internal fun settledStatus(context: Context, status: PaymentCaptureStatus): PaymentCaptureStatus {
+    val raw = CaptureStore.state(context)
+    val processes = runCatching {
+        context.getSystemService(ActivityManager::class.java)?.runningAppProcesses?.map {
+            CaptureProcess(it.pid, it.uid, it.processName)
+        }
+    }.getOrNull()
+    fun active(key: String) = CaptureLiveness.isActive(
+        raw, key, processes, context.applicationInfo.uid, "${context.packageName}:capture"
+    )
+    return status.copy(
+        watchRunning = status.watchRunning && active("watch"),
+        connected = status.connected && active("connected")
+    )
 }
 
 @Composable fun PaymentSetup(enabled: Boolean, granted: Boolean, expanded: Boolean, onError: (String) -> Unit) {
@@ -83,19 +89,19 @@ private fun watchAlive(context: Context, raw: Map<String, String>): Boolean {
             when {
                 !enabled -> "自动识别未开启"
                 !granted -> "已开启，但系统还没有授权读取通知"
-                !status.connected -> "已授权，监听尚未连接"
-                !status.watchRunning -> "监听中 · 后台常驻未开启"
+                !status.connected -> "已授权，尚未确认监听连接"
+                !status.watchRunning -> "监听中 · 后台常驻未确认运行"
                 else -> "后台监听中"
             },
             style = MaterialTheme.typography.titleMedium
         )
         Text(
-            "通知读取：${if (granted) "已授权" else "未授权"} · 确认提醒：${if (remindersNow) "可用" else "未开启"} · 后台常驻：${if (status.watchRunning) "运行中" else "未运行"}",
+            "通知读取：${if (granted) "已授权" else "未授权"} · 确认提醒：${if (remindersNow) "可用" else "未开启"} · 后台常驻：${if (status.watchRunning) "运行中" else "未确认运行"}",
             style = MaterialTheme.typography.bodySmall
         )
         if (enabled && granted && !status.connected) {
             Text(
-                "系统已授权，但练呗的监听连接现在没有建立。此时收到付款通知不会被记录。可以点下方“尝试重新连接监听”；如果仍然不行（例如被系统强行停止过），请到系统「通知使用权」里关闭再开启练呗，或重启手机。",
+                "系统已授权，但目前无法确认监听连接，付款通知可能无法记录。可以点下方“尝试重新连接监听”，或到系统「通知使用权」中检查授权。若曾强行停止练呗，需要先手动打开应用，再检查连接状态。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error
             )
@@ -106,7 +112,7 @@ private fun watchAlive(context: Context, raw: Map<String, String>): Boolean {
         }
         if (enabled && granted && status.connected && !status.watchRunning) {
             Text(
-                "现在只有系统绑定期间在监听；从最近任务划走或系统清理后可能停止。开启后台常驻可在划走后继续采集，代价是常驻一条通知。",
+                "监听已连接，但尚未确认后台常驻运行。开启后台常驻有助于维持监听，并会显示常驻通知；划走应用、系统清理或后台限制仍可能中断监听。强行停止后需要手动打开应用。",
                 style = MaterialTheme.typography.bodySmall
             )
         }
@@ -120,7 +126,7 @@ private fun watchAlive(context: Context, raw: Map<String, String>): Boolean {
             Text("Android ${Build.VERSION.RELEASE} · ${Build.MANUFACTURER} ${Build.MODEL}", style = MaterialTheme.typography.bodySmall)
             Text("未收到系统通知、内容被隐藏、仅在支付App内显示时，无法通过通知自动识别。不会读取历史账单。", style = MaterialTheme.typography.bodySmall)
             OutlinedButton(enabled = enabled && granted, onClick = {
-                val ok = runCatching { PaymentListener.requestRebindNow(context) }.isSuccess
+                val ok = PaymentListener.requestRebindNow(context)
                 if (!ok) onError("暂时无法重连，请在系统通知使用权中关闭后重新开启练呗。")
             }) { Text("尝试重新连接监听") }
             OutlinedButton(enabled = enabled && granted, onClick = {
@@ -128,7 +134,7 @@ private fun watchAlive(context: Context, raw: Map<String, String>): Boolean {
             }) { Text("检查通知监听") }
             TextButton(enabled = enabled, onClick = {
                 if (status.watchRunning) PaymentWatchService.stop(context) else PaymentWatchService.start(context)
-            }) { Text(if (status.watchRunning) "关闭后台常驻（划走后将停止采集）" else "开启后台常驻（划走后继续采集）") }
+            }) { Text(if (status.watchRunning) "关闭后台常驻" else "开启后台常驻") }
             if (status.selfRequestedAt > 0) Text(
                 if (status.selfReceivedAt >= status.selfRequestedAt) "上次检查通过：${stamp(status.selfReceivedAt)}，监听服务已收到测试通知"
                 else "等待测试通知送达；若一直未通过，请检查通知权限并尝试重连。",

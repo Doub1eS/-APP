@@ -14,7 +14,7 @@
         <service android:name=".PaymentWatchService" android:process=":capture" android:exported="false"
             android:stopWithTask="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Keeps the user enabled payment notification listener bound after the task is removed so payments are still captured." />
+                android:value="User enabled continuous payment notification capture with visible status and stop controls; system force-stop can interrupt capture." />
         </service>
         <receiver android:name=".PaymentActionReceiver" android:exported="false" />
         <receiver android:name=".PaymentBootReceiver" android:process=":capture" android:exported="false">

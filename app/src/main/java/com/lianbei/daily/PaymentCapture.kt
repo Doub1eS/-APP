@@ -3,6 +3,9 @@ package com.lianbei.daily
 import android.app.Notification
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.time.Instant
 import java.time.ZoneId
@@ -45,7 +48,7 @@ object PaymentCapture {
         postedAt: Long,
         notification: Notification,
         session: String
-    ): String = withContext(Dispatchers.Default) {
+    ): String = withContext(Dispatchers.IO) {
         val state = CaptureStore.state(context)
         if (state["enabled"] != "true" || session != state["session"].orEmpty()) return@withContext "识别已关闭"
         val source = PaymentParser.sources[pkg] ?: return@withContext "来源未支持"
@@ -69,47 +72,46 @@ object PaymentCapture {
 
             val time = Instant.ofEpochMilli(eventTime).atZone(ZoneId.systemDefault())
             val pending = PendingPayment(id, payment.cents, payment.merchant, payment.source, time.toLocalDate().toString(), time.format(DateTimeFormatter.ofPattern("HH:mm")))
-            val known = CaptureStore.claim(context, identities + legacy, pending.id)
-            if (known != null) {
-                // A later notification may add a merchant that the first one did not carry.
-                if (payment.merchant != PaymentParser.MISSING_MERCHANT) CaptureStore.enqueueMerchant(context, known, payment.merchant)
-                return@withContext result("重复通知，已跳过")
+            when (CaptureStore.capture(context, pending, identities, legacy, session)) {
+                CaptureStore.Commit.DISABLED -> return@withContext "识别已关闭"
+                CaptureStore.Commit.DUPLICATE -> return@withContext result("重复通知，已跳过")
+                CaptureStore.Commit.NEW -> Unit
             }
-            // The user may have switched capture off while this notification was being parsed.
-            val latest = CaptureStore.state(context)
-            if (latest["enabled"] != "true" || session != latest["session"].orEmpty()) return@withContext result("识别已关闭")
-            CaptureStore.enqueuePayment(context, pending, identities, legacy)
             // A disabled reminder must never prevent the payment from appearing in the inbox.
             runCatching { PaymentNotifications.show(context, pending) }
             result("已加入待确认")
-        } catch (e: Exception) {
-            result("处理失败，请检查待确认列表后重试")
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) {
+            runCatching { result("处理失败，请检查待确认列表后重试") }
+            "处理失败，请检查待确认列表后重试"
         }
     }
 }
 
 /** Writes queued captures into Room. Runs in the default process, which owns the database. */
 object CaptureDrain {
-    suspend fun drain(context: Context, dao: RecordDao): Int = withContext(Dispatchers.IO) {
+    private val mutex = Mutex()
+    suspend fun drain(context: Context, dao: RecordDao): Int = withContext(Dispatchers.IO) { mutex.withLock {
         var applied = 0
         var batches = 0
         while (batches < 8) {
             val batch = CaptureStore.takeBatch(context) ?: break
             batches++
-            val lines = runCatching { batch.readLines() }.getOrDefault(emptyList()).filter { it.isNotBlank() }
+            val lines = android.util.AtomicFile(batch).openRead().bufferedReader().use { it.readLines() }.filter { it.isNotBlank() }
             val keep = mutableListOf<String>()
             lines.forEach { line ->
-                val ok = runCatching { apply(context, dao, line) }.isSuccess
-                if (!ok) keep.add(line)
+                try { apply(dao, line) }
+                catch (e: CancellationException) { throw e }
+                catch (_: Exception) { keep.add(line) }
             }
             CaptureStore.finishBatch(context, batch, keep)
             applied += lines.size - keep.size
             if (keep.isNotEmpty()) break
         }
         applied
-    }
+    } }
 
-    private suspend fun apply(context: Context, dao: RecordDao, line: String) {
+    private suspend fun apply(dao: RecordDao, line: String) {
         val row = org.json.JSONObject(line)
         val id = row.getString("id")
         if (row.optString("kind") == "merchant") {
