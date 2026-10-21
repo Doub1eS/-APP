@@ -19,22 +19,33 @@ object PaymentParser {
     private val money = Regex("""(?<![\d.,-])(?:[¥￥]\s*($number)|($number)\s*元)""")
     private val paidLabel = Regex("""(?:实付金额|实际支付|实付款|实付|付款金额|支付金额)\s*[：:]?\s*""")
     private val paid = Regex("""(?:实付金额|实际支付|实付款|实付|付款金额|支付金额)\s*[：:]?\s*(?:[¥￥]\s*($number)|($number)\s*元)""")
+    // Alipay's transaction reminder labels the expense before appending a promotion.
+    private val expenseReminder = Regex("""^\s*你有一笔\s*($number)\s*元的支出(?=$|[，,。；;\s])""")
+    private val couponInvitation = Regex("""(?:^|[，,。；;\s])领(?:取)?\s*\d+(?:\.\d{1,2})?\s*元(?:小)?红包""")
 
     fun parse(pkg: String, title: String, body: String): ParsedPayment? = inspect(pkg,title,body).payment
 
     fun inspect(pkg: String, title: String, body: String): PaymentParseResult {
         val source=sources[pkg] ?: return PaymentParseResult(reason="来源未支持")
-        if(title.trim() !in titles) return PaymentParseResult(reason="不是支持的支付服务标题")
+        val isExpenseReminder = pkg == "com.eg.android.AlipayGphone" && title.trim() == "交易提醒"
+        if(title.trim() !in titles && !isExpenseReminder) return PaymentParseResult(reason="不是支持的支付服务标题")
         if(body.length>6000) return PaymentParseResult(reason="内容过长，已跳过")
         if(body.isBlank() || hidden.containsMatchIn(body))
             return PaymentParseResult(reason="内容为空或已隐藏")
+        val expense = if (isExpenseReminder) expenseReminder.find(body) else null
         val text=title + " " + body
-        if(excluded.containsMatchIn(text)) return PaymentParseResult(reason="退款、转账、收款或非完成交易")
-        if(!success.containsMatchIn(text) && !(pkg=="com.tencent.mm" && title.trim()=="微信支付" && compactPaid.containsMatchIn(body))) return PaymentParseResult(reason="未找到明确付款成功")
+        // Only an explicit invitation to claim a coupon is exempted from the red-packet guard.
+        // Refunds, transfers and actual red-packet transactions remain excluded.
+        val exclusionText = if (expense != null) couponInvitation.replace(text, "") else text
+        if(excluded.containsMatchIn(exclusionText)) return PaymentParseResult(reason="退款、转账、收款或非完成交易")
+        if(isExpenseReminder && expense == null) return PaymentParseResult(reason="未找到明确付款成功")
+        if(expense == null && !success.containsMatchIn(text) && !(pkg=="com.tencent.mm" && title.trim()=="微信支付" && compactPaid.containsMatchIn(body))) return PaymentParseResult(reason="未找到明确付款成功")
         val labels=paidLabel.findAll(body).count()
-        if(labels==0 && Regex("优惠|折扣|抵扣|订单金额|订单总额|原价|余额|积分").containsMatchIn(body))
+        if(expense != null && (labels > 0 || Regex("支出").findAll(body).count() != 1))
+            return PaymentParseResult(reason="付款金额不唯一或格式不支持")
+        if(expense == null && labels==0 && Regex("优惠|折扣|抵扣|订单金额|订单总额|原价|余额|积分").containsMatchIn(body))
             return PaymentParseResult(reason="只有优惠或订单信息，实付金额不明确")
-        val matches=(if(labels>0) paid else money).findAll(body).toList()
+        val matches=if (expense != null) listOf(expense) else (if(labels>0) paid else money).findAll(body).toList()
         // An invalid explicitly labelled amount must never fall back to an order total.
         if(matches.size!=1 || (labels>0 && labels!=1)) return PaymentParseResult(reason="付款金额不唯一或格式不支持")
         val amount=matches.single().groupValues.let {it[1].ifEmpty {it[2]}}

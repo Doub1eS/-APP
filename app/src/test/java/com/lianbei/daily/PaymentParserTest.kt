@@ -3,6 +3,47 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PaymentParserTest {
+    @Test fun alipayExpenseReminderUsesExpenseInsteadOfPromotionalAmount() {
+        listOf(
+            "你有一笔89.00元的支出",
+            "你有一笔89.00元的支出，领2元小…",
+            "你有一笔89.00元的支出，领2元小红包",
+            "你有一笔89.00元的支出，领取2元红包",
+            "你有一笔89.00元的支出，优惠2元"
+        ).forEach { body ->
+            val p = PaymentParser.parse("com.eg.android.AlipayGphone", "交易提醒", body)
+            assertEquals(body, 8900L, p?.cents)
+            assertEquals("支付宝", p?.source)
+            assertEquals(PaymentParser.MISSING_MERCHANT, p?.merchant)
+        }
+    }
+
+    @Test fun alipayExpenseReminderRequiresTrustedSourceAndCompletedUnambiguousExpense() {
+        val body = "你有一笔89.00元的支出，领2元小红包"
+        assertNull(PaymentParser.parse("com.tencent.mm", "交易提醒", body))
+        assertNull(PaymentParser.parse("com.taobao.taobao", "交易提醒", body))
+        assertNull(PaymentParser.parse("com.eg.android.AlipayGphone", "朋友", body))
+        listOf(
+            "预计你有一笔89.00元的支出",
+            "你有一笔89.00元的收入",
+            "你有一笔-89.00元的支出",
+            "你有一笔89.001元的支出",
+            "你有一笔0元的支出",
+            "你有一笔1,089.00元的支出",
+            "你有一笔89.00元的支出待确认",
+            "你有一笔89.00元的支出，退款成功",
+            "你有一笔89.00元的支出，转账成功",
+            "你有一笔89.00元的支出，红包已领取",
+            "你有一笔89.00元的支出，领取2元红包，转账成功",
+            "你有一笔89.00元的支出，实付金额：2元",
+            "你有一笔89.00元的支出\n你有一笔2元的支出",
+            "你有一笔89.00元的支出，另有支出2元",
+            "领2元红包"
+        ).forEach {
+            assertNull(it, PaymentParser.parse("com.eg.android.AlipayGphone", "交易提醒", it))
+        }
+    }
+
     @Test fun xiaomiWechatPaidNotification() {
         val payment=PaymentParser.parse("com.tencent.mm","微信支付","已支付¥22.00")
         assertEquals(2200L,payment?.cents)
