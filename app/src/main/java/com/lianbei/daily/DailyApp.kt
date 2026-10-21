@@ -27,9 +27,11 @@ import kotlinx.coroutines.withContext
 fun DailyApp(dao: RecordDao, openPayments: Boolean = false, onPaymentsConsumed: () -> Unit = {},
     openSubscriptions: Boolean = false, onSubscriptionsConsumed: () -> Unit = {}) {
     var page by rememberSaveable { mutableStateOf("今天") }
+    var finance by rememberSaveable { mutableStateOf(false) }
+    androidx.activity.compose.BackHandler(enabled=finance) { finance=false }
     var paymentInbox by rememberSaveable { mutableStateOf(openPayments) }
-    LaunchedEffect(openPayments) { if (openPayments) paymentInbox = true }
-    LaunchedEffect(openSubscriptions) { if(openSubscriptions) {page="订阅";paymentInbox=false;onSubscriptionsConsumed()} }
+    LaunchedEffect(openPayments) { if (openPayments) { finance=false;paymentInbox = true } }
+    LaunchedEffect(openSubscriptions) { if(openSubscriptions) {finance=false;page="订阅";paymentInbox=false;onSubscriptionsConsumed()} }
     val pendingPayments by dao.pending().collectAsStateWithLifecycle(emptyList())
     val foodRows by dao.foodEntries().collectAsStateWithLifecycle(initialValue = null)
     val foodEntries = foodRows.orEmpty()
@@ -61,15 +63,16 @@ fun DailyApp(dao: RecordDao, openPayments: Boolean = false, onPaymentsConsumed: 
     Scaffold(snackbarHost = { SnackbarHost(snackbar) }, bottomBar = {
         NavigationBar(containerColor=MaterialTheme.colorScheme.surface) {
             listOf("今天","订阅","回看","我的").forEachIndexed { index,label ->
-                NavigationBarItem(selected=page==label,onClick={page=label},icon={
+                NavigationBarItem(selected=page==label,onClick={page=label;finance=false},icon={
                     NavMark(index)
                 },label={Text(label)})
             }
         }
     }) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
-            if(page=="订阅") SubscriptionScreen(dao,all)
-            else if(page=="回看") InsightsScreen(all,{editingId=it.id;selected=it.kind},{deleting=it},foodEntries)
+            if(finance) FinanceScreen(dao) { finance=false }
+            else if(page=="订阅") SubscriptionScreen(dao,all)
+            else if(page=="回看") InsightsScreen(all,{editingId=it.id;selected=it.kind},{deleting=it},foodEntries,onFinance={finance=true})
             else LazyColumn(Modifier.fillMaxSize().testTag("daily-list"), contentPadding=PaddingValues(20.dp),verticalArrangement=Arrangement.spacedBy(16.dp)) {
                 if(page=="我的") {
                     item { PageTitle("我的", "留住每一天的小小积累。") }
@@ -78,6 +81,11 @@ fun DailyApp(dao: RecordDao, openPayments: Boolean = false, onPaymentsConsumed: 
                         Text("${all.map {it.date}.distinct().size} 天留下足迹 · ${categories.size} 个自定义类别")
                     } }
                     item { BackupPanel(dao) }
+                    item { Panel {
+                        Text("工资与预算",style=MaterialTheme.typography.titleLarge)
+                        Text("工资到账、累计个税与每月收支，放在一起看。")
+                        TextButton(modifier=Modifier.testTag("open-finance"),onClick={finance=true}) { Text("查看工资与预算") }
+                    } }
                     item { Panel {
                         Text("示例数据",style=MaterialTheme.typography.titleLarge)
                         Text("添加最近7天的日常和3条订阅，方便查看页面。示例会计入统计，并标注为示例；可随时清除。")
@@ -100,6 +108,7 @@ fun DailyApp(dao: RecordDao, openPayments: Boolean = false, onPaymentsConsumed: 
                     }
                     item {
                         TextButton(onClick={paymentInbox=true}){Text("支付待确认 · ${pendingPayments.size}")}
+                        OutlinedButton(modifier=Modifier.fillMaxWidth().testTag("open-finance"),onClick={finance=true}) { Text("工资与预算 · 记录到账 / 查看月度收支") }
                     }
                     item {
                         Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically) {

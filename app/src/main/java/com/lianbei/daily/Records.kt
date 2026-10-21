@@ -34,12 +34,13 @@ data class CustomCategory(@PrimaryKey val name: String)
 data class PendingPayment(@PrimaryKey val id: String, val cents: Long, val merchant: String, val source: String, val date: String, val time: String, val status: String = "pending", @ColumnInfo(defaultValue = "'其他'") val category: String = "其他")
 
 @Dao
-interface RecordDao {
+interface RecordDao : FinanceQueries {
     @Query("SELECT * FROM categories") suspend fun allCategories():List<CustomCategory>
     @Query("SELECT * FROM payments") suspend fun allPayments():List<PendingPayment>
     @Query("SELECT * FROM payment_identities") suspend fun allIdentities():List<PaymentIdentity>
-    @Transaction suspend fun backupSnapshot():BackupData = BackupData(4, allRecords(), allCategories(), allSubscriptions(),
-        allSubscriptionPayments(), allFoodEntries().map { BackupFood(it.foodId,it.expenseId,it.ownsExpense,photoPath=it.photoPath) }, allPayments(), allIdentities())
+    @Transaction suspend fun backupSnapshot():BackupData = BackupData(5, allRecords(), allCategories(), allSubscriptions(),
+        allSubscriptionPayments(), allFoodEntries().map { BackupFood(it.foodId,it.expenseId,it.ownsExpense,photoPath=it.photoPath) }, allPayments(), allIdentities(),
+        allSalaryProfiles(), allPayrolls(), allTaxOpenings(), allBudgets())
     @Transaction suspend fun mergeBackup(data:BackupData):RestoreResult = Backup.merge(this,data)
     @Query("UPDATE payments SET cents=:cents,merchant=:merchant,date=:date,time=:time,category=:category WHERE id=:id AND status='pending'")
     suspend fun editPaymentRow(id:String,cents:Long,merchant:String,date:String,time:String,category:String):Int
@@ -159,10 +160,20 @@ interface RecordDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun addCategory(category: CustomCategory)
 }
 
-@Database(entities = [DailyRecord::class, CustomCategory::class, PendingPayment::class, Subscription::class, SubscriptionPayment::class, FoodEntry::class, PaymentIdentity::class], version = 6, exportSchema = false)
+@Database(entities = [DailyRecord::class, CustomCategory::class, PendingPayment::class, Subscription::class, SubscriptionPayment::class, FoodEntry::class, PaymentIdentity::class,
+    SalaryProfile::class, PayrollRecord::class, TaxOpening::class, MonthlyBudget::class], version = 7, exportSchema = false)
 abstract class DailyDatabase : RoomDatabase() {
     abstract fun records(): RecordDao
     companion object {
+        val MIGRATION_6_7 = object : Migration(6,7) {
+            override fun migrate(db:SupportSQLiteDatabase) {
+                val terms = "grossCents INTEGER NOT NULL, pensionBaseCents INTEGER NOT NULL, medicalBaseCents INTEGER NOT NULL, unemploymentBaseCents INTEGER NOT NULL, fundBaseCents INTEGER NOT NULL, pensionRateBp INTEGER NOT NULL, medicalRateBp INTEGER NOT NULL, unemploymentRateBp INTEGER NOT NULL, fundRateBp INTEGER NOT NULL, specialDeductionCents INTEGER NOT NULL, deductionsConfirmed INTEGER NOT NULL"
+                db.execSQL("CREATE TABLE IF NOT EXISTS salary_profile (id INTEGER NOT NULL PRIMARY KEY, $terms)")
+                db.execSQL("CREATE TABLE IF NOT EXISTS payrolls (month TEXT NOT NULL PRIMARY KEY, date TEXT NOT NULL, actualNetCents INTEGER NOT NULL, $terms, actualTaxCents INTEGER, otherDeductionCents INTEGER NOT NULL, note TEXT NOT NULL)")
+                db.execSQL("CREATE TABLE IF NOT EXISTS tax_openings (year INTEGER NOT NULL PRIMARY KEY, startMonth INTEGER NOT NULL, taxableCents INTEGER NOT NULL, paidTaxCents INTEGER NOT NULL, confirmed INTEGER NOT NULL)")
+                db.execSQL("CREATE TABLE IF NOT EXISTS monthly_budgets (month TEXT NOT NULL, category TEXT NOT NULL, limitCents INTEGER NOT NULL, PRIMARY KEY(month, category))")
+            }
+        }
         val MIGRATION_5_6 = object : Migration(5,6) {
             override fun migrate(db:SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE payments ADD COLUMN category TEXT NOT NULL DEFAULT '其他'")
@@ -194,7 +205,7 @@ abstract class DailyDatabase : RoomDatabase() {
         @Volatile private var instance: DailyDatabase? = null
         fun get(context: Context): DailyDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(context.applicationContext, DailyDatabase::class.java, "daily.db")
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6).build().also { instance = it }
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7).build().also { instance = it }
         }
     }
 }

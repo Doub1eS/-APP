@@ -3,6 +3,8 @@ package com.lianbei.daily
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -35,7 +37,7 @@ import java.time.LocalDate
                 withContext(Dispatchers.IO) {
                     checkNotNull(context.contentResolver.openOutputStream(uri,"wt")).bufferedWriter().use{it.write(content)}
                 }
-                message="备份已导出，包含照片、订阅和支付处理记录"
+                message="备份已导出，包含照片、订阅、支付处理记录及工资、计税期初和预算"
             } catch(e:CancellationException){throw e}
             catch(e:Exception){error(e)}
             finally {busy=false}
@@ -55,8 +57,8 @@ import java.time.LocalDate
     }
     Panel {
         Text("数据与备份",style=MaterialTheme.typography.titleLarge)
-        Text("记录保存在这台设备，无需登录。JSON备份包含照片、订阅、消费关联和支付处理记录，可在练呗中恢复。")
-        Text("恢复会合并新增数据；同ID保留本机内容，不改变识别开关和系统授权。单个备份最多64MB。",style=MaterialTheme.typography.bodySmall)
+        Text("记录保存在这台设备，无需登录。JSON备份包含照片、订阅、消费关联、支付处理记录，以及工资模板、工资单、计税期初和月度预算，可在练呗中恢复。")
+        Text("恢复会合并新增数据；同ID、同月工资、同年计税期初及同月同分类预算保留本机内容，不改变识别开关和系统授权。单个备份最多64MB。",style=MaterialTheme.typography.bodySmall)
         Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
             Button(enabled=!busy,onClick={export.launch("练呗备份-${LocalDate.now()}.json")}){Text("导出记录")}
             OutlinedButton(enabled=!busy,onClick={picker.launch(arrayOf("application/json","text/plain","application/octet-stream"))}){Text("导入备份")}
@@ -75,7 +77,9 @@ import java.time.LocalDate
                     val result=Backup.restore(context,dao,data)
                     SubscriptionReminders.refresh(context)
                     preview=null
-                    message="恢复完成：新增 ${result.added} 项，跳过 ${result.skipped} 项，${result.conflicts} 项冲突已保留本机数据。"
+                    message="恢复完成：新增 ${result.added} 项，跳过 ${result.skipped} 项，${result.conflicts} 项冲突已保留本机数据。"+
+                        "\n财务新增：${result.salaryProfilesAdded} 个工资模板、${result.payrollsAdded} 张工资单、"+
+                        "${result.taxOpeningsAdded} 条计税期初、${result.budgetsAdded} 项预算。"
                 } catch(e:CancellationException){throw e}
                 catch(e:Exception){preview=null;error(e)}
                 finally{busy=false}
@@ -86,11 +90,13 @@ import java.time.LocalDate
 
 @Composable internal fun BackupPreviewDialog(data:BackupData,busy:Boolean,onDismiss:()->Unit,onRestore:()->Unit) {
     AlertDialog(onDismissRequest={if(!busy)onDismiss()},title={Text("恢复这份备份？")},text={
-        Column(verticalArrangement=Arrangement.spacedBy(8.dp)) {
+        Column(modifier=Modifier.verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(8.dp)) {
             Text("备份版本 ${data.version}")
             Text("${data.records.size} 条日常记录 · ${data.foodEntries.count{it.photoBase64.isNotBlank()}} 张照片")
             Text("${data.subscriptions.size} 条订阅 · ${data.payments.size} 条支付处理记录")
-            Text("只合并新增数据。同ID内容、已占用的消费关联均保留本机版本；重复导入不会重复添加。")
+            Text("${data.salaryProfiles.size} 个工资模板 · ${data.payrolls.size} 张工资单")
+            Text("${data.taxOpenings.size} 条计税期初 · ${data.budgets.size} 项月度预算")
+            Text("只合并新增数据。同ID内容、已占用的消费关联、同月工资、同年计税期初和同月同分类预算均保留本机版本；重复导入不会重复添加。")
             if(busy)LinearProgressIndicator(Modifier.fillMaxWidth())
         }
     },confirmButton={TextButton(enabled=!busy,onClick=onRestore){Text("确认合并恢复")}},

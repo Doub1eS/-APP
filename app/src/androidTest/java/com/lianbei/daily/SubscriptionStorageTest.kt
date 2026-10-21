@@ -44,7 +44,7 @@ class SubscriptionStorageTest {
    sql.execSQL("INSERT INTO payments VALUES ('p',100,'店铺','微信','2026-10-14','12:00','pending')")
    sql.version=2
   }
-  val db=Room.databaseBuilder(context,DailyDatabase::class.java,name).addMigrations(DailyDatabase.MIGRATION_2_3, DailyDatabase.MIGRATION_3_4, DailyDatabase.MIGRATION_4_5, DailyDatabase.MIGRATION_5_6).build()
+  val db=Room.databaseBuilder(context,DailyDatabase::class.java,name).addMigrations(DailyDatabase.MIGRATION_2_3, DailyDatabase.MIGRATION_3_4, DailyDatabase.MIGRATION_4_5, DailyDatabase.MIGRATION_5_6, DailyDatabase.MIGRATION_6_7).build()
   try {val dao=db.records();assertEquals("保留记录",dao.observeAll().first().single().title);assertEquals("旅行",dao.categories().first().single().name);assertEquals(1,dao.pending().first().size)
    dao.saveSubscription(Subscription("s","会员",100,"MONTH","2026-10-16",paymentUrl="https://example.com/pay"))
    assertEquals("https://example.com/pay",dao.subscriptions().first().single().paymentUrl)

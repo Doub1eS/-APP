@@ -55,7 +55,7 @@ class PaymentsTest {
             sql.execSQL("INSERT INTO records VALUES ('old','NOTE','2026-10-14','12:00','保留记录','',NULL,'',1)")
             sql.version = 1
         }
-        val db = Room.databaseBuilder(context, DailyDatabase::class.java, name).addMigrations(DailyDatabase.MIGRATION_1_2, DailyDatabase.MIGRATION_2_3, DailyDatabase.MIGRATION_3_4, DailyDatabase.MIGRATION_4_5, DailyDatabase.MIGRATION_5_6).build()
+        val db = Room.databaseBuilder(context, DailyDatabase::class.java, name).addMigrations(DailyDatabase.MIGRATION_1_2, DailyDatabase.MIGRATION_2_3, DailyDatabase.MIGRATION_3_4, DailyDatabase.MIGRATION_4_5, DailyDatabase.MIGRATION_5_6, DailyDatabase.MIGRATION_6_7).build()
         try {
             assertEquals("保留记录", db.records().observeAll().first().single().title)
             assertTrue(db.records().pending().first().isEmpty())

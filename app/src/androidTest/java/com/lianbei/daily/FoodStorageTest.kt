@@ -37,7 +37,7 @@ class FoodStorageTest {
    it.execSQL("INSERT INTO payments VALUES ('legacy',1200,'旧商户','微信','2026-01-01','12:00','pending')")
    it.version=3
   }
-  val upgraded=Room.databaseBuilder(context,DailyDatabase::class.java,name).addMigrations(DailyDatabase.MIGRATION_3_4, DailyDatabase.MIGRATION_4_5, DailyDatabase.MIGRATION_5_6).build()
+  val upgraded=Room.databaseBuilder(context,DailyDatabase::class.java,name).addMigrations(DailyDatabase.MIGRATION_3_4, DailyDatabase.MIGRATION_4_5, DailyDatabase.MIGRATION_5_6, DailyDatabase.MIGRATION_6_7).build()
   try {assertEquals("牛肉面",upgraded.records().allRecords().single().detail);assertEquals("旧订阅",upgraded.records().allSubscriptions().single().name);assertTrue(upgraded.records().allFoodEntries().isEmpty())
    assertEquals("其他",upgraded.records().payment("legacy")?.category)
    assertEquals("旧商户",upgraded.records().payment("legacy")?.merchant)

@@ -24,7 +24,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import java.time.LocalDate
 
-@Composable fun InsightsScreen(all: List<DailyRecord>, onEdit: (DailyRecord)->Unit, onDelete: (DailyRecord)->Unit, foodEntries:List<FoodEntry> = emptyList()) {
+@Composable fun InsightsScreen(all: List<DailyRecord>, onEdit: (DailyRecord)->Unit, onDelete: (DailyRecord)->Unit, foodEntries:List<FoodEntry> = emptyList(), onFinance:(()->Unit)? = null) {
     var kindName by rememberSaveable { mutableStateOf(Kind.EXPENSE.name) }
     val kind=Kind.valueOf(kindName)
     var month by rememberSaveable { mutableStateOf(false) }
@@ -41,6 +41,7 @@ import java.time.LocalDate
     fun clearFilters() { selectedDay=null; selectedGroup=null }
     LazyColumn(Modifier.fillMaxSize().testTag("insights"),contentPadding=PaddingValues(20.dp),verticalArrangement=Arrangement.spacedBy(16.dp)) {
         item { PageTitle("回看", "把零散的记录，连成生活的轮廓。") }
+        if(onFinance!=null) item { OutlinedButton(onClick=onFinance,modifier=Modifier.fillMaxWidth().testTag("open-finance")) { Text("工资与预算 · 月度收支") } }
         item { Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(8.dp)) {
             Kind.entries.forEach { k -> FilterChip(selected=k==kind,onClick={kindName=k.name;clearFilters()},label={Text(k.label)}) }
         } }

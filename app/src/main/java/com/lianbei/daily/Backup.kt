@@ -3,9 +3,12 @@ package com.lianbei.daily
 import android.content.Context
 import android.net.Uri
 import android.util.Base64
+import android.util.JsonReader
+import android.util.JsonToken
 import android.graphics.BitmapFactory
 import java.io.File
 import java.io.InputStream
+import java.io.StringReader
 import java.time.LocalDate
 import java.time.LocalTime
 import kotlinx.coroutines.Dispatchers
@@ -16,8 +19,11 @@ import org.json.JSONObject
 data class BackupFood(val foodId:String,val expenseId:String?,val ownsExpense:Boolean,val photoBase64:String="",val photoPath:String="")
 data class BackupData(val version:Int,val records:List<DailyRecord>,val categories:List<CustomCategory>,
     val subscriptions:List<Subscription>,val subscriptionPayments:List<SubscriptionPayment>,val foodEntries:List<BackupFood>,
-    val payments:List<PendingPayment>,val identities:List<PaymentIdentity>)
-data class RestoreResult(val added:Int,val skipped:Int,val conflicts:Int)
+    val payments:List<PendingPayment>,val identities:List<PaymentIdentity>,
+    val salaryProfiles:List<SalaryProfile> = emptyList(),val payrolls:List<PayrollRecord> = emptyList(),
+    val taxOpenings:List<TaxOpening> = emptyList(),val budgets:List<MonthlyBudget> = emptyList())
+data class RestoreResult(val added:Int,val skipped:Int,val conflicts:Int,
+    val salaryProfilesAdded:Int=0,val payrollsAdded:Int=0,val taxOpeningsAdded:Int=0,val budgetsAdded:Int=0)
 
 object Backup {
     const val MAX_BYTES = 64 * 1024 * 1024
@@ -36,7 +42,7 @@ object Backup {
 
     suspend fun export(context:Context,dao:RecordDao):String = FoodPhotos.withLifecycleLock {
         val data=dao.backupSnapshot()
-        val json=JSONObject().put("version",4)
+        val json=JSONObject().put("version",5)
         fun array(key:String,rows:List<JSONObject>) { json.put(key,JSONArray(rows)) }
         array("records",data.records.map { r -> obj("id" to r.id,"kind" to r.kind,"date" to r.date,"time" to r.time,"title" to r.title,
             "detail" to r.detail,"value" to r.value,"extra" to r.extra,"createdAt" to r.createdAt) })
@@ -57,6 +63,12 @@ object Backup {
         array("payments",data.payments.map { p -> obj("id" to p.id,"cents" to p.cents,"merchant" to p.merchant,"source" to p.source,
             "date" to p.date,"time" to p.time,"status" to p.status,"category" to p.category) })
         array("identities",data.identities.map { obj("identity" to it.identity,"paymentId" to it.paymentId) })
+        array("salaryProfiles",data.salaryProfiles.map { obj("id" to it.id,"terms" to termsJson(it.terms)) })
+        array("payrolls",data.payrolls.map { obj("month" to it.month,"date" to it.date,"actualNetCents" to it.actualNetCents,
+            "terms" to termsJson(it.terms),"actualTaxCents" to it.actualTaxCents,"otherDeductionCents" to it.otherDeductionCents,"note" to it.note) })
+        array("taxOpenings",data.taxOpenings.map { obj("year" to it.year,"startMonth" to it.startMonth,
+            "taxableCents" to it.taxableCents,"paidTaxCents" to it.paidTaxCents,"confirmed" to it.confirmed) })
+        array("budgets",data.budgets.map { obj("month" to it.month,"category" to it.category,"limitCents" to it.limitCents) })
         val text=json.toString()
         require(text.toByteArray(Charsets.UTF_8).size<=MAX_BYTES) { "备份文件超过64MB" }
         text
@@ -64,10 +76,15 @@ object Backup {
 
     fun parse(text:String):BackupData {
         require(text.toByteArray(Charsets.UTF_8).size<=MAX_BYTES) { "备份文件超过64MB" }
-        val root=JSONObject(text.removePrefix("\uFEFF"))
+        val json=text.removePrefix("\uFEFF")
+        // JSONObject otherwise silently keeps the last duplicate key (including version).
+        validateJsonKeys(json)
+        val root=JSONObject(json)
         val rawVersion=integer(root,"version")
-        require(rawVersion in 1L..4L) { "不支持此备份版本，请更新练呗后重试" }
+        require(rawVersion in 1L..5L) { "不支持此备份版本，请更新练呗后重试" }
         val version=rawVersion.toInt()
+        if(version==5)knownFields(root,setOf("version","records","categories","subscriptions","subscriptionPayments",
+            "foodEntries","payments","identities","salaryProfiles","payrolls","taxOpenings","budgets"))
         fun objects(key:String,required:Boolean=false):List<JSONObject> {
             if(!root.has(key)) {require(!required) { "备份缺少$key" };return emptyList()}
             val array=root.getJSONArray(key)
@@ -112,6 +129,27 @@ object Backup {
             PendingPayment(str(p,"id"),cents,str(p,"merchant"),str(p,"source"),date(p,"date"),time(p,"time"),status,category)
         }
         val identities=objects("identities").map { PaymentIdentity(str(it,"identity"),str(it,"paymentId")) }
+        val salaryProfiles=objects("salaryProfiles",version==5).map { p ->
+            fields(p,"id","terms")
+            SalaryProfile(int(p,"id"),parseTerms(p.getJSONObject("terms"))).also(FinanceValidation::profile)
+        }
+        val payrolls=objects("payrolls",version==5).map { p ->
+            fields(p,"month","date","actualNetCents","terms","actualTaxCents","otherDeductionCents","note")
+            PayrollRecord(str(p,"month"),str(p,"date"),integer(p,"actualNetCents"),parseTerms(p.getJSONObject("terms")),
+                if(p.isNull("actualTaxCents"))null else integer(p,"actualTaxCents"),integer(p,"otherDeductionCents"),
+                str(p,"note","",500)).also(FinanceValidation::payroll)
+        }
+        val taxOpenings=objects("taxOpenings",version==5).map { o ->
+            fields(o,"year","startMonth","taxableCents","paidTaxCents","confirmed")
+            TaxOpening(int(o,"year"),int(o,"startMonth"),integer(o,"taxableCents"),integer(o,"paidTaxCents"),
+                boolean(o,"confirmed")).also(FinanceValidation::opening)
+        }
+        val budgets=objects("budgets",version==5).map { b ->
+            fields(b,"month","category","limitCents")
+            MonthlyBudget(str(b,"month"),str(b,"category",""),integer(b,"limitCents")).also(FinanceValidation::budget)
+        }
+        unique(salaryProfiles.map{it.id});unique(payrolls.map{it.month});unique(taxOpenings.map{it.year})
+        unique(budgets.map{it.month to it.category})
         unique(records.map{it.id});unique(categories.map{it.name});unique(subscriptions.map{it.id});unique(foods.map{it.foodId})
         unique(payments.map{it.id});unique(identities.map{it.identity});unique(subscriptionPayments.map{it.subscriptionId+"\n"+it.dueDate})
         unique(foods.mapNotNull{it.expenseId});unique(subscriptionPayments.map{it.recordId})
@@ -126,7 +164,8 @@ object Backup {
         require(foods.mapNotNull{it.expenseId}.intersect(subscriptionPayments.map{it.recordId}.toSet()).isEmpty()) { "一笔消费关联了多个用途" }
         val paymentIds=payments.map{it.id}.toSet()
         identities.forEach { require(it.paymentId in paymentIds) { "支付去重身份缺少对应支付" } }
-        return BackupData(version,records,categories,subscriptions,subscriptionPayments,foods,payments,identities)
+        return BackupData(version,records,categories,subscriptions,subscriptionPayments,foods,payments,identities,
+            salaryProfiles,payrolls,taxOpenings,budgets)
     }
 
     suspend fun restore(context:Context,dao:RecordDao,data:BackupData):RestoreResult = FoodPhotos.withLifecycleLock {
@@ -271,7 +310,78 @@ object Backup {
             else if(canonical!=null){dao.addIdentity(i.copy(paymentId=canonical));added++}
             else {skipped++;conflicts++}
         }
-        return RestoreResult(added,skipped,conflicts)
+        // Business keys are the finance primary keys. Never call REPLACE for a local row.
+        suspend fun <T,K> mergeFinance(incoming:List<T>,existing:List<T>,key:(T)->K,validate:(T)->Unit,save:suspend (T)->Unit):Int {
+            unique(incoming.map(key))
+            val local=existing.associateBy(key)
+            var count=0
+            for(row in incoming) {
+                validate(row)
+                val previous=local[key(row)]
+                if(previous==null){save(row);added++;count++}
+                else {skipped++;if(previous!=row)conflicts++}
+            }
+            return count
+        }
+        val profilesAdded=mergeFinance(data.salaryProfiles,dao.allSalaryProfiles(),{it.id},FinanceValidation::profile,dao::saveSalaryProfile)
+        val payrollsAdded=mergeFinance(data.payrolls,dao.allPayrolls(),{it.month},FinanceValidation::payroll,dao::savePayroll)
+        val openingsAdded=mergeFinance(data.taxOpenings,dao.allTaxOpenings(),{it.year},FinanceValidation::opening,dao::saveTaxOpening)
+        val budgetsAdded=mergeFinance(data.budgets,dao.allBudgets(),{it.month to it.category},FinanceValidation::budget,dao::saveBudget)
+        return RestoreResult(added,skipped,conflicts,profilesAdded,payrollsAdded,openingsAdded,budgetsAdded)
+    }
+
+    private fun termsJson(t:SalaryTerms)=obj("grossCents" to t.grossCents,"pensionBaseCents" to t.pensionBaseCents,
+        "medicalBaseCents" to t.medicalBaseCents,"unemploymentBaseCents" to t.unemploymentBaseCents,"fundBaseCents" to t.fundBaseCents,
+        "pensionRateBp" to t.pensionRateBp,"medicalRateBp" to t.medicalRateBp,"unemploymentRateBp" to t.unemploymentRateBp,
+        "fundRateBp" to t.fundRateBp,"specialDeductionCents" to t.specialDeductionCents,"deductionsConfirmed" to t.deductionsConfirmed)
+
+    private fun parseTerms(t:JSONObject):SalaryTerms {
+        fields(t,"grossCents","pensionBaseCents","medicalBaseCents","unemploymentBaseCents","fundBaseCents",
+            "pensionRateBp","medicalRateBp","unemploymentRateBp","fundRateBp","specialDeductionCents","deductionsConfirmed")
+        return SalaryTerms(integer(t,"grossCents"),integer(t,"pensionBaseCents"),integer(t,"medicalBaseCents"),
+            integer(t,"unemploymentBaseCents"),integer(t,"fundBaseCents"),int(t,"pensionRateBp"),int(t,"medicalRateBp"),
+            int(t,"unemploymentRateBp"),int(t,"fundRateBp"),integer(t,"specialDeductionCents"),boolean(t,"deductionsConfirmed"))
+    }
+
+    private fun knownFields(row:JSONObject,allowed:Set<String>) {
+        require(row.keys().asSequence().all{it in allowed}) { "备份包含未知字段" }
+    }
+    private fun fields(row:JSONObject,vararg required:String) {
+        knownFields(row,required.toSet())
+        required.forEach { require(row.has(it)) { "备份缺少$it" } }
+    }
+    private fun int(row:JSONObject,key:String):Int {
+        val value=integer(row,key)
+        require(value in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong()) { "备份${key}整数超出范围" }
+        return value.toInt()
+    }
+
+    private fun validateJsonKeys(text:String) {
+        JsonReader(StringReader(text)).use { reader ->
+            fun value(depth:Int) {
+                require(depth<=64) { "备份嵌套层数过多" }
+                when(reader.peek()) {
+                    JsonToken.BEGIN_OBJECT -> {
+                        reader.beginObject()
+                        val keys=mutableSetOf<String>()
+                        while(reader.hasNext()) {
+                            require(keys.add(reader.nextName())) { "备份存在重复字段" }
+                            value(depth+1)
+                        }
+                        reader.endObject()
+                    }
+                    JsonToken.BEGIN_ARRAY -> {
+                        reader.beginArray()
+                        while(reader.hasNext())value(depth+1)
+                        reader.endArray()
+                    }
+                    JsonToken.STRING,JsonToken.NUMBER,JsonToken.BOOLEAN,JsonToken.NULL -> reader.skipValue()
+                    else -> throw IllegalArgumentException("备份JSON格式无效")
+                }
+            }
+            value(0)
+            require(reader.peek()==JsonToken.END_DOCUMENT) { "备份包含多余内容" }
+        }
     }
 
     private fun obj(vararg fields:Pair<String,Any?>)=JSONObject().apply { fields.forEach{put(it.first,it.second ?: JSONObject.NULL)} }
@@ -285,15 +395,15 @@ object Backup {
         require(value is Int || value is Long) { "备份${key}不是整数" }
         return (value as Number).toLong()
     }
-    private fun boolean(row:JSONObject,key:String,default:Boolean):Boolean {
-        if(!row.has(key))return default
+    private fun boolean(row:JSONObject,key:String,default:Boolean?=null):Boolean {
+        if(!row.has(key))return requireNotNull(default) { "备份缺少$key" }
         val value=row.get(key)
         require(value is Boolean) { "备份${key}不是布尔值" }
         return value
     }
     private fun date(row:JSONObject,key:String)=str(row,key).also { LocalDate.parse(it) }
     private fun time(row:JSONObject,key:String)=str(row,key).also { LocalTime.parse(it) }
-    private fun unique(values:List<String>) {require(values.size==values.toSet().size) { "备份存在重复标识或重复关联" }}
+    private fun <T> unique(values:List<T>) {require(values.size==values.toSet().size) { "备份存在重复标识或重复关联" }}
     private fun validCategory(category:String):Boolean {
         val parent=category.substringBefore(" / ");val child=category.substringAfter(" / ","")
         return parent in ExpenseCategories.groups && (child.isBlank() || child in ExpenseCategories.groups.getValue(parent))
